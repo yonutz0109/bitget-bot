@@ -6,23 +6,20 @@ import time
 import json
 import os
 from datetime import datetime
-API_KEY = os.environ.get("BITGET_API_KEY")
-SECRET_KEY = os.environ.get("BITGET_SECRET_KEY")
-PASSPHRASE = os.environ.get("BITGET_PASSPHRASE")
 
-# Config din environment variables
+API_KEY = os.environ.get("BITGET_API_KEY", "")
+SECRET_KEY = os.environ.get("BITGET_SECRET_KEY", "")
+PASSPHRASE = os.environ.get("BITGET_PASSPHRASE", "")
 
 BASE_URL = "https://api.bitget.com"
 
-# Simbolurile pe care le monitorizăm
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT"]
 
-# Parametri strategie
 RSI_PERIOD = 14
-RSI_BUY = 30      # Cumpără când RSI < 30
-RSI_SELL = 70     # Vinde când RSI > 70
-PROFIT_TARGET = 0.05   # Vinde la +5% profit
-STOP_LOSS = 0.03       # Stop loss la -3%
+RSI_BUY = 30
+RSI_SELL = 70
+PROFIT_TARGET = 0.05
+STOP_LOSS = 0.03
 
 def sign(message, secret):
     mac = hmac.new(bytes(secret, encoding='utf8'), bytes(message, encoding='utf-8'), digestmod='sha256')
@@ -79,7 +76,6 @@ def calculate_rsi(candles, period=14):
     closes = [float(c[4]) for c in reversed(candles)]
     if len(closes) < period + 1:
         return 50
-    
     gains = []
     losses = []
     for i in range(1, period + 1):
@@ -90,16 +86,12 @@ def calculate_rsi(candles, period=14):
         else:
             gains.append(0)
             losses.append(abs(diff))
-    
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
-    
     if avg_loss == 0:
         return 100
-    
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
-    
     for i in range(period + 1, len(closes)):
         diff = closes[i] - closes[i-1]
         gain = diff if diff > 0 else 0
@@ -111,7 +103,6 @@ def calculate_rsi(candles, period=14):
         else:
             rs = avg_gain / avg_loss
             rsi = 100 - (100 / (1 + rs))
-    
     return round(rsi, 2)
 
 def get_current_price(symbol):
@@ -126,15 +117,12 @@ def get_current_price(symbol):
 
 def place_order(symbol, side, amount_usdt=None, quantity=None):
     path = "/api/v2/spot/trade/place-order"
-    coin = symbol.replace("USDT", "")
-    
     if side == "buy":
         body = {
             "symbol": symbol,
             "side": "buy",
             "orderType": "market",
             "force": "gtc",
-            "size": str(round(amount_usdt, 2)),
             "quoteSize": str(round(amount_usdt, 2))
         }
     else:
@@ -145,7 +133,6 @@ def place_order(symbol, side, amount_usdt=None, quantity=None):
             "force": "gtc",
             "size": str(quantity)
         }
-    
     body_str = json.dumps(body)
     headers = get_headers("POST", path, body_str)
     r = requests.post(BASE_URL + path, headers=headers, data=body_str)
@@ -154,31 +141,25 @@ def place_order(symbol, side, amount_usdt=None, quantity=None):
 positions = {}
 
 def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def run_bot():
     log("🤖 Bot pornit! Monitorizez: " + ", ".join(SYMBOLS))
-    
     while True:
         try:
             usdt_balance = get_spot_balance("USDT")
             log(f"💰 Balanță USDT: ${usdt_balance:.2f}")
-            
             for symbol in SYMBOLS:
                 coin = symbol.replace("USDT", "")
                 candles = get_candles(symbol, "1H", 50)
-                
                 if not candles:
                     continue
-                
                 rsi = calculate_rsi(candles, RSI_PERIOD)
                 price = get_current_price(symbol)
-                
                 log(f"📊 {symbol} | Preț: ${price:.4f} | RSI: {rsi}")
-                
                 if rsi < RSI_BUY and symbol not in positions:
                     if usdt_balance >= 5:
-                        trade_amount = min(usdt_balance * 0.3, usdt_balance)
+                        trade_amount = usdt_balance * 0.3
                         log(f"🟢 BUY {symbol} | RSI={rsi} | ${trade_amount:.2f}")
                         result = place_order(symbol, "buy", amount_usdt=trade_amount)
                         if result.get("code") == "00000":
@@ -187,15 +168,12 @@ def run_bot():
                             log(f"✅ Cumpărat {quantity:.6f} {coin} la ${price:.4f}")
                         else:
                             log(f"❌ Eroare BUY: {result}")
-                
                 elif symbol in positions:
                     entry_price = positions[symbol]["price"]
                     quantity = positions[symbol]["quantity"]
                     pnl_pct = (price - entry_price) / entry_price
-                    
                     should_sell = False
                     reason = ""
-                    
                     if rsi > RSI_SELL:
                         should_sell = True
                         reason = f"RSI={rsi} > {RSI_SELL}"
@@ -205,7 +183,6 @@ def run_bot():
                     elif pnl_pct <= -STOP_LOSS:
                         should_sell = True
                         reason = f"Stop-loss {pnl_pct*100:.1f}%"
-                    
                     if should_sell:
                         coin_balance = get_coin_balance(coin)
                         if coin_balance > 0:
@@ -216,10 +193,8 @@ def run_bot():
                                 del positions[symbol]
                             else:
                                 log(f"❌ Eroare SELL: {result}")
-            
-            log("⏳ Aștept 5 minute până la următoarea verificare...\n")
+            log("⏳ Aștept 5 minute...\n")
             time.sleep(300)
-            
         except Exception as e:
             log(f"❌ Eroare: {e}")
             time.sleep(60)
