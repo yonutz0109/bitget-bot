@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: bitget-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BITGET_API_KEY
+        sync: false
+      - key: BITGET_SECRET_KEY
+        sync: false
+      - key: BITGET_PASSPHRASE
+        sync: false
