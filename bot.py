@@ -44,9 +44,12 @@ def get_headers(method, path, body=""):
 
 def get_spot_balance(coin="USDT"):
     path = "/api/v2/spot/account/assets"
-    headers = get_headers("GET", path)
-    r = requests.get(BASE_URL + path, headers=headers)
+    params = f"?coin={coin}"
+    full_path = path + params
+    headers = get_headers("GET", full_path)
+    r = requests.get(BASE_URL + full_path, headers=headers)
     data = r.json()
+    log(f"DEBUG balance: {data}")
     if data.get("code") == "00000":
         for asset in data.get("data", []):
             if asset["coin"] == coin:
@@ -55,8 +58,10 @@ def get_spot_balance(coin="USDT"):
 
 def get_coin_balance(coin):
     path = "/api/v2/spot/account/assets"
-    headers = get_headers("GET", path)
-    r = requests.get(BASE_URL + path, headers=headers)
+    params = f"?coin={coin}"
+    full_path = path + params
+    headers = get_headers("GET", full_path)
+    r = requests.get(BASE_URL + full_path, headers=headers)
     data = r.json()
     if data.get("code") == "00000":
         for asset in data.get("data", []):
