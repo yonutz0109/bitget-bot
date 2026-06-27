@@ -6,11 +6,11 @@ import time
 import json
 import os
 from datetime import datetime
-
-# Config din environment variables
 API_KEY = os.environ.get("BITGET_API_KEY")
 SECRET_KEY = os.environ.get("BITGET_SECRET_KEY")
 PASSPHRASE = os.environ.get("BITGET_PASSPHRASE")
+
+# Config din environment variables
 
 BASE_URL = "https://api.bitget.com"
 
