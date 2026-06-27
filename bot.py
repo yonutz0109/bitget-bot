@@ -151,7 +151,6 @@ def place_order(symbol, side, amount_usdt=None, quantity=None):
     r = requests.post(BASE_URL + path, headers=headers, data=body_str)
     return r.json()
 
-# Tracking pozitii deschise: {symbol: {price: float, quantity: float}}
 positions = {}
 
 def log(msg):
@@ -177,10 +176,9 @@ def run_bot():
                 
                 log(f"📊 {symbol} | Preț: ${price:.4f} | RSI: {rsi}")
                 
-                # CUMPĂRĂ dacă RSI < 30 și nu avem poziție deschisă
                 if rsi < RSI_BUY and symbol not in positions:
-                    if usdt_balance >= 5:  # Minim $5 per trade
-                        trade_amount = min(usdt_balance * 0.3, usdt_balance)  # 30% din balanță
+                    if usdt_balance >= 5:
+                        trade_amount = min(usdt_balance * 0.3, usdt_balance)
                         log(f"🟢 BUY {symbol} | RSI={rsi} | ${trade_amount:.2f}")
                         result = place_order(symbol, "buy", amount_usdt=trade_amount)
                         if result.get("code") == "00000":
@@ -190,7 +188,6 @@ def run_bot():
                         else:
                             log(f"❌ Eroare BUY: {result}")
                 
-                # VINDE dacă avem poziție deschisă
                 elif symbol in positions:
                     entry_price = positions[symbol]["price"]
                     quantity = positions[symbol]["quantity"]
@@ -220,8 +217,8 @@ def run_bot():
                             else:
                                 log(f"❌ Eroare SELL: {result}")
             
-            log("⏳ Aștept 1 oră până la următoarea verificare...\n")
-            time.sleep(3600)  # Verifică la fiecare oră
+            log("⏳ Aștept 5 minute până la următoarea verificare...\n")
+            time.sleep(300)
             
         except Exception as e:
             log(f"❌ Eroare: {e}")
