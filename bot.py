@@ -13,12 +13,12 @@ PASSPHRASE = os.environ.get("BITGET_PASSPHRASE", "")
 
 BASE_URL = "https://api.bitget.com"
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT"]
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "BGBUSDT", "UNIUSDT", "DOGEUSDT"]
 
 RSI_PERIOD = 14
-RSI_BUY = 30
-RSI_SELL = 70
-PROFIT_TARGET = 0.05
+RSI_BUY = 40
+RSI_SELL = 65
+PROFIT_TARGET = 0.03
 STOP_LOSS = 0.03
 
 def sign(message, secret):
@@ -49,7 +49,6 @@ def get_spot_balance(coin="USDT"):
     headers = get_headers("GET", full_path)
     r = requests.get(BASE_URL + full_path, headers=headers)
     data = r.json()
-    log(f"DEBUG balance: {data}")
     if data.get("code") == "00000":
         for asset in data.get("data", []):
             if asset["coin"] == coin:
@@ -164,7 +163,7 @@ def run_bot():
                 log(f"📊 {symbol} | Preț: ${price:.4f} | RSI: {rsi}")
                 if rsi < RSI_BUY and symbol not in positions:
                     if usdt_balance >= 5:
-                        trade_amount = usdt_balance * 0.3
+                        trade_amount = usdt_balance * 0.2
                         log(f"🟢 BUY {symbol} | RSI={rsi} | ${trade_amount:.2f}")
                         result = place_order(symbol, "buy", amount_usdt=trade_amount)
                         if result.get("code") == "00000":
