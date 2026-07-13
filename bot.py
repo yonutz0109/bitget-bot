@@ -19,12 +19,13 @@ BASE_URL = "https://api.bitget.com"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "BGBUSDT", "UNIUSDT", "DOGEUSDT"]
 
 RSI_PERIOD = 14
-RSI_BUY_15M = 45      # RSI 15m sub 45 = semnal
-RSI_MIN_1H = 35       # RSI 1H peste 35 = nu e prabusire
+RSI_BUY_15M = 45
+RSI_MIN_1H = 32
 RSI_SELL = 65
-STOP_LOSS = 0.02          # -2%
-TRAILING_TRIGGER = 0.01   # trailing porneste la +1%
-TRAILING_DISTANCE = 0.007 # vinde daca scade 0.7% de la varf
+EMA_TOLERANCE = 0.985     # permite pana la 1.5% sub EMA50
+STOP_LOSS = 0.02
+TRAILING_TRIGGER = 0.01
+TRAILING_DISTANCE = 0.007
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -149,7 +150,7 @@ positions = {}
 
 def run_bot():
     mode = "🧪 DRY RUN (simulare)" if DRY_RUN else "💰 LIVE (bani reali)"
-    start_msg = f"🤖 Bot pornit (mod RAPID)! Mod: {mode}\nMonitorizez: {', '.join(SYMBOLS)}\nStrategie: RSI 15m<{RSI_BUY_15M} + RSI 1H>{RSI_MIN_1H} + preț>EMA50 + trailing rapid"
+    start_msg = f"🤖 Bot pornit (v3 - EMA relaxat)! Mod: {mode}\nMonitorizez: {', '.join(SYMBOLS)}\nStrategie: RSI 15m<{RSI_BUY_15M} + RSI 1H>{RSI_MIN_1H} + preț>{EMA_TOLERANCE*100:.1f}% din EMA50"
     log(start_msg)
     send_telegram(start_msg)
     
@@ -177,13 +178,12 @@ def run_bot():
                 if price == 0 or ema50 is None:
                     continue
                 
-                above_ema = price > ema50
-                trend = "📈" if above_ema else "📉"
-                log(f"📊 {symbol} | ${price:.4f} | RSI15m: {rsi_15m} | RSI1H: {rsi_1h} | EMA50: {trend}")
+                ema_ok = price > ema50 * EMA_TOLERANCE
+                trend = "✅" if ema_ok else "❌"
+                log(f"📊 {symbol} | ${price:.4f} | RSI15m: {rsi_15m} | RSI1H: {rsi_1h} | EMA: {trend}")
                 
-                # === CUMPARARE ===
                 if symbol not in positions:
-                    if rsi_15m < RSI_BUY_15M and rsi_1h > RSI_MIN_1H and above_ema:
+                    if rsi_15m < RSI_BUY_15M and rsi_1h > RSI_MIN_1H and ema_ok:
                         if usdt_balance >= 5:
                             trade_amount = usdt_balance * 0.25
                             result = place_order(symbol, "buy", amount_usdt=trade_amount)
@@ -194,8 +194,10 @@ def run_bot():
                                 log(msg)
                                 send_telegram(msg)
                                 usdt_balance -= trade_amount
+                            else:
+                                log(f"❌ Eroare BUY: {result}")
+                                send_telegram(f"❌ Eroare BUY {symbol}: {result.get('msg', 'necunoscut')}")
                 
-                # === VANZARE ===
                 else:
                     pos = positions[symbol]
                     entry = pos["price"]
@@ -230,6 +232,9 @@ def run_bot():
                                 log(msg)
                                 send_telegram(msg)
                                 del positions[symbol]
+                            else:
+                                log(f"❌ Eroare SELL: {result}")
+                                send_telegram(f"❌ Eroare SELL {symbol}: {result.get('msg', 'necunoscut')}")
             
             log("⏳ Aștept 2 minute...\n")
             time.sleep(120)
