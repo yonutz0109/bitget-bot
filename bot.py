@@ -135,8 +135,7 @@ def place_order(symbol, side, amount_usdt=None, quantity=None):
         return {"code": "00000", "dry_run": True}
     path = "/api/v2/spot/trade/place-order"
     if side == "buy":
-        body = {"symbol": symbol, "side": "buy", "orderType": "market", "force": "gtc", "quoteSize": str(round(amount_usdt, 2))}
-    
+        body = {"symbol": symbol, "side": "buy", "orderType": "market", "force": "gtc", "size": str(round(amount_usdt, 2))}
     else:
         body = {"symbol": symbol, "side": "sell", "orderType": "market", "force": "gtc", "size": str(quantity)}
     body_str = json.dumps(body)
@@ -151,7 +150,7 @@ positions = {}
 
 def run_bot():
     mode = "🧪 DRY RUN (simulare)" if DRY_RUN else "💰 LIVE (bani reali)"
-    start_msg = f"🤖 Bot pornit (v3 - EMA relaxat)! Mod: {mode}\nMonitorizez: {', '.join(SYMBOLS)}\nStrategie: RSI 15m<{RSI_BUY_15M} + RSI 1H>{RSI_MIN_1H} + preț>{EMA_TOLERANCE*100:.1f}% din EMA50"
+    start_msg = f"🤖 Bot pornit (v4 - fix ordine)! Mod: {mode}\nMonitorizez: {', '.join(SYMBOLS)}\nStrategie: RSI 15m<{RSI_BUY_15M} + RSI 1H>{RSI_MIN_1H} + preț>{EMA_TOLERANCE*100:.1f}% din EMA50"
     log(start_msg)
     send_telegram(start_msg)
     
