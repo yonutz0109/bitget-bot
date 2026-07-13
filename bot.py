@@ -136,6 +136,7 @@ def place_order(symbol, side, amount_usdt=None, quantity=None):
     path = "/api/v2/spot/trade/place-order"
     if side == "buy":
         body = {"symbol": symbol, "side": "buy", "orderType": "market", "force": "gtc", "quoteSize": str(round(amount_usdt, 2))}
+    
     else:
         body = {"symbol": symbol, "side": "sell", "orderType": "market", "force": "gtc", "size": str(quantity)}
     body_str = json.dumps(body)
