@@ -5,6 +5,7 @@ import base64
 import time
 import json
 import os
+import math
 from datetime import datetime
 
 API_KEY = os.environ.get("BITGET_API_KEY", "")
@@ -22,7 +23,7 @@ RSI_PERIOD = 14
 RSI_BUY_15M = 45
 RSI_MIN_1H = 32
 RSI_SELL = 65
-EMA_TOLERANCE = 0.985     # permite pana la 1.5% sub EMA50
+EMA_TOLERANCE = 0.985
 STOP_LOSS = 0.02
 TRAILING_TRIGGER = 0.01
 TRAILING_DISTANCE = 0.007
@@ -59,6 +60,28 @@ def get_headers(method, path, body=""):
         "Content-Type": "application/json",
         "locale": "en-US"
     }
+
+# Precizia (nr. zecimale) pentru cantitate, per simbol - citita de la Bitget
+quantity_precision = {}
+
+def load_symbol_precision():
+    try:
+        path = "/api/v2/spot/public/symbols"
+        r = requests.get(BASE_URL + path)
+        data = r.json()
+        if data.get("code") == "00000":
+            for s in data.get("data", []):
+                sym = s.get("symbol", "")
+                if sym in SYMBOLS:
+                    quantity_precision[sym] = int(s.get("quantityPrecision", 4))
+            log(f"Precizie cantitate: {quantity_precision}")
+    except Exception as e:
+        log(f"Eroare la citirea preciziei: {e}")
+
+def floor_qty(symbol, qty):
+    decimals = quantity_precision.get(symbol, 4)
+    factor = 10 ** decimals
+    return math.floor(qty * factor) / factor
 
 def get_spot_balance(coin="USDT"):
     path = "/api/v2/spot/account/assets"
@@ -137,7 +160,8 @@ def place_order(symbol, side, amount_usdt=None, quantity=None):
     if side == "buy":
         body = {"symbol": symbol, "side": "buy", "orderType": "market", "force": "gtc", "size": str(round(amount_usdt, 2))}
     else:
-        body = {"symbol": symbol, "side": "sell", "orderType": "market", "force": "gtc", "size": str(quantity)}
+        qty = floor_qty(symbol, quantity)
+        body = {"symbol": symbol, "side": "sell", "orderType": "market", "force": "gtc", "size": str(qty)}
     body_str = json.dumps(body)
     headers = get_headers("POST", path, body_str)
     r = requests.post(BASE_URL + path, headers=headers, data=body_str)
@@ -150,7 +174,8 @@ positions = {}
 
 def run_bot():
     mode = "🧪 DRY RUN (simulare)" if DRY_RUN else "💰 LIVE (bani reali)"
-    start_msg = f"🤖 Bot pornit (v4 - fix ordine)! Mod: {mode}\nMonitorizez: {', '.join(SYMBOLS)}\nStrategie: RSI 15m<{RSI_BUY_15M} + RSI 1H>{RSI_MIN_1H} + preț>{EMA_TOLERANCE*100:.1f}% din EMA50"
+    load_symbol_precision()
+    start_msg = f"🤖 Bot pornit (v5 - fix vanzare zecimale)! Mod: {mode}\nMonitorizez: {', '.join(SYMBOLS)}"
     log(start_msg)
     send_telegram(start_msg)
     
@@ -224,6 +249,7 @@ def run_bot():
                             sell_qty = pos["quantity"]
                         else:
                             sell_qty = get_coin_balance(coin)
+                        sell_qty = floor_qty(symbol, sell_qty)
                         if sell_qty > 0:
                             result = place_order(symbol, "sell", quantity=sell_qty)
                             if result.get("code") == "00000":
@@ -235,6 +261,8 @@ def run_bot():
                             else:
                                 log(f"❌ Eroare SELL: {result}")
                                 send_telegram(f"❌ Eroare SELL {symbol}: {result.get('msg', 'necunoscut')}")
+                        else:
+                            del positions[symbol]
             
             log("⏳ Aștept 2 minute...\n")
             time.sleep(120)
