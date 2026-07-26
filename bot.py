@@ -44,9 +44,27 @@ EMA_PERIOD_TREND = 50  # pe 1h
 EMA_PERIOD_MACRO = 50  # pe 4h pentru filtru macro
 
 # --- Risk Management (Dinamic cu ATR) ---
-RISK_PER_TRADE = 0.05
+RISK_PER_TRADE = 0.02          # redus de la 5% la 2% - 5% e prea mult pt un bot
+                                # automat fara supraveghere; cateva pierderi la
+                                # rand (normale statistic) erodeaza rapid contul
 MAX_ALLOCATION_PER_TRADE = 0.25
 MIN_TRADE_USDT = 5
+
+# NOU: limita globala de expunere - cu 3 pozitii simultane posibile la 25%
+# fiecare, se putea ajunge teoretic la 75% din cont in 3 monede corelate.
+# Acum limitam expunerea TOTALA (suma tuturor pozitiilor deschise), nu doar
+# per-tranzactie.
+MAX_TOTAL_EXPOSURE_PCT = 0.60   # maxim 60% din equity in pozitii deschise simultan
+
+# NOU: limita de pierdere zilnica - daca pierderile realizate intr-o zi
+# depasesc acest procent din equity, botul nu mai deschide pozitii noi pana
+# a doua zi (pozitiile deschise existente continua sa fie gestionate normal
+# - stop-loss/trailing tot functioneaza, doar nu se mai cumpara nimic nou).
+MAX_DAILY_DRAWDOWN_PCT = 0.05   # 5% din equity
+
+# NOU: comision estimat per parte (taker fee Bitget standard ~0.1%), folosit
+# ca sa aratam PnL NET (dupa taxe) in mesaje, nu doar miscarea bruta de pret.
+FEE_RATE_PER_SIDE = 0.001
 
 # --- Stop Loss & Trailing (Optimizate) ---
 TRAILING_TRIGGER = 0.025   # activează trailing după +2.5%
@@ -149,6 +167,8 @@ positions = {}
 last_sell_time = {}
 price_history = {}
 virtual_balance = None  # Pentru DRY_RUN
+daily_realized_pnl = 0.0   # NOU: suma PnL realizat (net) azi
+daily_pnl_date = None      # NOU: ziua curenta (string YYYY-MM-DD), pt reset
 
 def update_heartbeat(status="ok", extra=None):
     try:
@@ -157,13 +177,15 @@ def update_heartbeat(status="ok", extra=None):
     except Exception as e: logger.error(f"Heartbeat error: {e}")
 
 def load_state():
-    global positions, last_sell_time, price_history, virtual_balance
+    global positions, last_sell_time, price_history, virtual_balance, daily_realized_pnl, daily_pnl_date
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f: saved = json.load(f)
             positions = saved.get("positions", {})
             last_sell_time = saved.get("last_sell_time", {})
             virtual_balance = saved.get("virtual_balance", None)
+            daily_realized_pnl = saved.get("daily_realized_pnl", 0.0)
+            daily_pnl_date = saved.get("daily_pnl_date", None)
             ph_raw = saved.get("price_history", {})
             price_history = {k: deque(v, maxlen=CORRELATION_WINDOW*2) for k, v in ph_raw.items()}
             logger.info(f"Stare încărcată: {len(positions)} poziții")
@@ -178,6 +200,8 @@ def save_state():
             "positions": positions,
             "last_sell_time": last_sell_time,
             "virtual_balance": virtual_balance,
+            "daily_realized_pnl": daily_realized_pnl,
+            "daily_pnl_date": daily_pnl_date,
             "price_history": {k: list(v) for k, v in price_history.items()}
         }
         with open(tmp, "w") as f: json.dump(state, f, indent=2)
@@ -396,6 +420,29 @@ def log_trade_closed(symbol, entry, exit_price, qty, hours, reason, regime):
             csv.writer(f).writerow([datetime.now().isoformat(), symbol, entry, exit_price, qty, round(pnl_usd,4), round(pnl_pct*100,2), round(hours,2), reason, regime])
     except Exception as e: logger.error(f"CSV log error: {e}")
 
+# ---------------- DRAWDOWN ZILNIC & PnL NET ----------------
+def check_and_reset_daily_pnl():
+    """Reseteaza contorul de PnL zilnic daca a inceput o zi noua."""
+    global daily_realized_pnl, daily_pnl_date
+    today = datetime.now().strftime("%Y-%m-%d")
+    if daily_pnl_date != today:
+        if daily_pnl_date is not None:
+            logger.info(f"📅 Zi noua - reset PnL zilnic (ieri: {daily_realized_pnl:+.2f} USDT)")
+        daily_pnl_date = today
+        daily_realized_pnl = 0.0
+
+def daily_drawdown_exceeded(total_equity):
+    """True daca pierderile realizate azi depasesc pragul - blocheaza cumparari noi."""
+    if total_equity <= 0:
+        return False
+    limit = -total_equity * MAX_DAILY_DRAWDOWN_PCT
+    return daily_realized_pnl <= limit
+
+def net_pnl_pct(gross_pnl_pct):
+    """PnL procentual NET, dupa scaderea comisioanelor estimate de dus-intors (buy+sell)."""
+    return gross_pnl_pct - (2 * FEE_RATE_PER_SIDE)
+
+
 # ---------------- FILTRU BTC ----------------
 def get_btc_health():
     """
@@ -437,7 +484,7 @@ def get_btc_health():
 
 # ---------------- BOT LOOP ----------------
 def run_bot():
-    global virtual_balance
+    global virtual_balance, daily_realized_pnl, daily_pnl_date
     mode = "🧪 DRY RUN" if DRY_RUN else "💰 LIVE"
     load_symbol_precision()
     load_state()
@@ -453,9 +500,10 @@ def run_bot():
     # format numeric {:.2f}, ceea ce arunca ValueError la fiecare pornire LIVE.
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v11 (+ filtru BTC) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v12 (Risc întărit) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
-                 f"Features: ATR-Stops, Partial Profit, Macro Trend, Corelații Returns, Filtru BTC\n"
+                 f"Features: ATR-Stops, Partial Profit, Macro Trend, Corelații Returns, Filtru BTC,\n"
+                 f"Risc 2%, Expunere max {MAX_TOTAL_EXPOSURE_PCT*100:.0f}%, Daily DD max {MAX_DAILY_DRAWDOWN_PCT*100:.0f}%\n"
                  f"Monitorizez: {', '.join(SYMBOLS)}")
     logger.info(start_msg)
     send_telegram(start_msg)
@@ -463,10 +511,13 @@ def run_bot():
     while True:
         try:
             update_heartbeat("ok", {"loop": "start"})
+            check_and_reset_daily_pnl()
             usdt_balance = get_spot_balance("USDT")
             total_equity = get_total_equity(usdt_balance)
 
-            logger.info(f"💰 USDT: ${usdt_balance:.2f} | Equity: ${total_equity:.2f} | Pozitii: {len(positions)}/{MAX_CONCURRENT_POSITIONS}")
+            dd_blocked = daily_drawdown_exceeded(total_equity)
+            logger.info(f"💰 USDT: ${usdt_balance:.2f} | Equity: ${total_equity:.2f} | Pozitii: {len(positions)}/{MAX_CONCURRENT_POSITIONS} | "
+                       f"PnL azi: {daily_realized_pnl:+.2f} USDT{' | 🛑 DAILY DRAWDOWN ATINS' if dd_blocked else ''}")
 
             for sym in SYMBOLS:
                 p = get_current_price(sym)
@@ -525,11 +576,12 @@ def run_bot():
                         vwap_ok = price < vwap * 1.01 if vwap else True
                         corr_ok = check_correlation_filter(symbol)
 
-                        all_ok = (btc_healthy and macro_uptrend and ema_ok and not in_cooldown
+                        all_ok = (not dd_blocked and btc_healthy and macro_uptrend and ema_ok and not in_cooldown
                                   and rsi_ok and volume_ok and spread_ok and vwap_ok and corr_ok)
 
                         if not all_ok:
                             blocked = []
+                            if dd_blocked: blocked.append("daily-drawdown")
                             if not btc_healthy: blocked.append(f"BTC({btc_reason})")
                             if not macro_uptrend: blocked.append("macro4h")
                             if not ema_ok: blocked.append("EMA1h")
@@ -545,6 +597,15 @@ def run_bot():
                         if all_ok:
                             stop_pct = compute_stop_pct(atr, price)
                             trade_amount = compute_trade_size(usdt_balance, total_equity, stop_pct, price)
+
+                            # NOU: cap global de expunere - suma tuturor pozitiilor deschise
+                            # + tranzactia noua nu poate depasi MAX_TOTAL_EXPOSURE_PCT din equity.
+                            current_exposure = max(0.0, total_equity - usdt_balance)
+                            max_exposure_allowed = total_equity * MAX_TOTAL_EXPOSURE_PCT
+                            room_left = max(0.0, max_exposure_allowed - current_exposure)
+                            if trade_amount > room_left:
+                                trade_amount = room_left
+                                logger.info(f"⚠️ {symbol}: sizing redus la ${trade_amount:.2f} din cauza limitei de expunere globala ({MAX_TOTAL_EXPOSURE_PCT*100:.0f}%)")
 
                             if trade_amount >= MIN_TRADE_USDT:
                                 # NOU: masuram soldul monedei INAINTE de cumparare, ca sa
@@ -631,7 +692,18 @@ def run_bot():
                                     emoji = "✅" if pnl_pct > 0 else "❌"
                                     opened_dt = datetime.fromisoformat(pos["opened_at"])
                                     hours_held = (datetime.now() - opened_dt).total_seconds() / 3600
-                                    msg = (f"🔴 SELL {symbol}\n{reason}\n{emoji} PnL: {pnl_pct*100:+.1f}%\n"
+
+                                    # NOU: PnL NET (dupa scaderea comisioanelor estimate de
+                                    # dus-intors), ca sa nu arate un profit brut inselator.
+                                    net_pct = net_pnl_pct(pnl_pct)
+                                    net_usd = (price - entry) * sell_qty - (entry * sell_qty + price * sell_qty) * FEE_RATE_PER_SIDE
+
+                                    # NOU: actualizam contorul de pierdere zilnica cu suma NETA
+                                    daily_realized_pnl += net_usd
+
+                                    msg = (f"🔴 SELL {symbol}\n{reason}\n{emoji} PnL brut: {pnl_pct*100:+.1f}% | "
+                                           f"net (cu taxe): {net_pct*100:+.1f}% (${net_usd:+.2f})\n"
+                                           f"📅 PnL azi: {daily_realized_pnl:+.2f} USDT\n"
                                            f"{'🧪 SIM' if DRY_RUN else '💰 REAL'}")
                                     logger.info(msg); send_telegram(msg)
                                     log_trade_closed(symbol, entry, price, sell_qty, hours_held, reason, regime)
