@@ -76,6 +76,15 @@ MAX_CORRELATION = 0.85
 ADX_PERIOD = 14
 ADX_TREND_THRESHOLD = 25
 
+# --- Filtru BTC (protectie pentru altcoin-uri) ---
+# Nu cumparam niciun altcoin daca BTC e sub trendul lui pe 1h sau a scazut
+# brusc in ultimele cateva ore - altcoin-urile urmeaza aproape mereu BTC
+# in jos, indiferent ce arata indicatorii lor locali.
+BTC_SYMBOL = "BTCUSDT"
+BTC_DROP_THRESHOLD = 0.04       # BTC scazut >4% in ultimele BTC_DROP_LOOKBACK_H ore = stop
+BTC_DROP_LOOKBACK_H = 4
+BTC_EMA_TOLERANCE = 0.99        # BTC trebuie sa fie aproape de/peste EMA50 1h
+
 REQUEST_TIMEOUT = 10
 LOOP_INTERVAL = 120
 
@@ -387,6 +396,45 @@ def log_trade_closed(symbol, entry, exit_price, qty, hours, reason, regime):
             csv.writer(f).writerow([datetime.now().isoformat(), symbol, entry, exit_price, qty, round(pnl_usd,4), round(pnl_pct*100,2), round(hours,2), reason, regime])
     except Exception as e: logger.error(f"CSV log error: {e}")
 
+# ---------------- FILTRU BTC ----------------
+def get_btc_health():
+    """
+    Verifica o singura data pe ciclu daca BTC e intr-o stare sanatoasa.
+    Returneaza (healthy: bool, motiv: str) - daca healthy=False, nu se
+    cumpara niciun altcoin in ciclul asta, indiferent de semnalele locale.
+    """
+    candles_1h = get_candles(BTC_SYMBOL, "1h", 100)
+    if not candles_1h:
+        return True, "date BTC indisponibile, nu blochez"  # fail-open, nu vrem sa blocam tot din eroare de retea
+
+    closes_1h = get_closes(candles_1h)
+    ema50_1h = calculate_ema(closes_1h, EMA_PERIOD_TREND)
+    price = get_current_price(BTC_SYMBOL)
+
+    if price == 0 or ema50_1h is None:
+        return True, "date BTC incomplete, nu blochez"
+
+    ema_ok = price > ema50_1h * BTC_EMA_TOLERANCE
+
+    # Scadere in ultimele BTC_DROP_LOOKBACK_H ore (candele de 1h)
+    drop_ok = True
+    if len(closes_1h) > BTC_DROP_LOOKBACK_H:
+        price_then = closes_1h[-(BTC_DROP_LOOKBACK_H + 1)]
+        if price_then > 0:
+            change = (price - price_then) / price_then
+            if change <= -BTC_DROP_THRESHOLD:
+                drop_ok = False
+
+    if not ema_ok and not drop_ok:
+        return False, f"BTC sub EMA1h si scazut {change*100:.1f}% in {BTC_DROP_LOOKBACK_H}h"
+    if not ema_ok:
+        return False, "BTC sub EMA1h"
+    if not drop_ok:
+        return False, f"BTC scazut {change*100:.1f}% in {BTC_DROP_LOOKBACK_H}h"
+
+    return True, "BTC sanatos"
+
+
 # ---------------- BOT LOOP ----------------
 def run_bot():
     global virtual_balance
@@ -405,9 +453,9 @@ def run_bot():
     # format numeric {:.2f}, ceea ce arunca ValueError la fiecare pornire LIVE.
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v10 (Optimizat, hotfix) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v11 (+ filtru BTC) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
-                 f"Features: ATR-Stops, Partial Profit, Macro Trend, Corelații Returns\n"
+                 f"Features: ATR-Stops, Partial Profit, Macro Trend, Corelații Returns, Filtru BTC\n"
                  f"Monitorizez: {', '.join(SYMBOLS)}")
     logger.info(start_msg)
     send_telegram(start_msg)
@@ -425,6 +473,11 @@ def run_bot():
                 if p > 0:
                     if sym not in price_history: price_history[sym] = deque(maxlen=CORRELATION_WINDOW*2)
                     price_history[sym].append(p)
+
+            # NOU: verificam sanatatea BTC o singura data pe ciclu, nu per moneda.
+            btc_healthy, btc_reason = get_btc_health()
+            if not btc_healthy:
+                logger.info(f"🚫 Filtru BTC activ: {btc_reason} — nu cumpar niciun altcoin in acest ciclu.")
 
             for symbol in SYMBOLS:
                 try:
@@ -472,10 +525,12 @@ def run_bot():
                         vwap_ok = price < vwap * 1.01 if vwap else True
                         corr_ok = check_correlation_filter(symbol)
 
-                        all_ok = macro_uptrend and ema_ok and not in_cooldown and rsi_ok and volume_ok and spread_ok and vwap_ok and corr_ok
+                        all_ok = (btc_healthy and macro_uptrend and ema_ok and not in_cooldown
+                                  and rsi_ok and volume_ok and spread_ok and vwap_ok and corr_ok)
 
                         if not all_ok:
                             blocked = []
+                            if not btc_healthy: blocked.append(f"BTC({btc_reason})")
                             if not macro_uptrend: blocked.append("macro4h")
                             if not ema_ok: blocked.append("EMA1h")
                             if in_cooldown: blocked.append("cooldown")
