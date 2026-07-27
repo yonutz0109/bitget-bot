@@ -30,7 +30,8 @@ LOG_FILE = "bot.log"
 HEARTBEAT_FILE = "heartbeat.json"
 TRADES_CSV = "trades.csv"
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "BGBUSDT", "UNIUSDT", "DOGEUSDT"]
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "BGBUSDT", "UNIUSDT", "DOGEUSDT",
+           "SOLUSDT", "ADAUSDT", "LINKUSDT"]
 
 # --- Indicatori ---
 RSI_PERIOD = 14
@@ -155,8 +156,19 @@ def safe_request(method, url, headers=None, data=None, params=None):
     try:
         r = session.request(method, url, headers=headers, data=data, params=params, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
-            logger.error(f"HTTP {r.status_code} la {url}: {r.text[:200]}")
-            return None
+            # NOU: incercam sa extragem mesajul REAL de eroare trimis de Bitget
+            # in corpul raspunsului (ex: {"code":"40762","msg":"size too small"}),
+            # nu doar codul HTTP - altfel place_order() arata generic "no response"
+            # in loc de motivul concret pentru care ordinul a fost respins.
+            try:
+                body = r.json()
+                bitget_msg = body.get("msg", "")
+                bitget_code = body.get("code", "")
+                logger.error(f"HTTP {r.status_code} la {url} — Bitget code={bitget_code}, msg={bitget_msg}")
+                return body  # contine deja code/msg reale, place_order le foloseste direct
+            except ValueError:
+                logger.error(f"HTTP {r.status_code} la {url}: {r.text[:300]}")
+                return None
         return r.json()
     except Exception as e:
         logger.error(f"Eroare rețea la {url}: {e}")
@@ -500,7 +512,7 @@ def run_bot():
     # format numeric {:.2f}, ceea ce arunca ValueError la fiecare pornire LIVE.
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v12 (Risc întărit) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v13 (+3 monede, erori clare) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"Features: ATR-Stops, Partial Profit, Macro Trend, Corelații Returns, Filtru BTC,\n"
                  f"Risc 2%, Expunere max {MAX_TOTAL_EXPOSURE_PCT*100:.0f}%, Daily DD max {MAX_DAILY_DRAWDOWN_PCT*100:.0f}%\n"
