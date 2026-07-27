@@ -387,7 +387,13 @@ def place_order(symbol, side, amount_usdt=None, quantity=None):
     body = {"symbol": symbol, "force": "gtc", "clientOid": client_oid}
 
     if side == "buy":
-        body.update(side="buy", orderType="market", funds=str(round(amount_usdt * 0.999, 2)))
+        # NOU: BUG REPARAT — API-ul Bitget v2 NU are un parametru "funds".
+        # Toate exemplele oficiale (place-order, batch-orders, websocket) folosesc
+        # doar "size" — pentru orderType=market + side=buy, "size" reprezinta suma
+        # in USDT de cheltuit (nu cantitatea de moneda). Cu "funds", Bitget nu
+        # gasea niciun camp "size" in request si respingea ordinul cu eroarea
+        # "Parameter size cannot be empty" (asta a cauzat esecurile repetate la UNI).
+        body.update(side="buy", orderType="market", size=str(round(amount_usdt * 0.999, 2)))
     else:
         body.update(side="sell", orderType="market", size=str(floor_qty(symbol, quantity)))
 
@@ -512,7 +518,7 @@ def run_bot():
     # format numeric {:.2f}, ceea ce arunca ValueError la fiecare pornire LIVE.
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v13 (+3 monede, erori clare) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v14 (fix critic: size vs funds) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"Features: ATR-Stops, Partial Profit, Macro Trend, Corelații Returns, Filtru BTC,\n"
                  f"Risc 2%, Expunere max {MAX_TOTAL_EXPOSURE_PCT*100:.0f}%, Daily DD max {MAX_DAILY_DRAWDOWN_PCT*100:.0f}%\n"
