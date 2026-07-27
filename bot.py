@@ -130,11 +130,21 @@ session.mount("https://", HTTPAdapter(max_retries=retry_cfg))
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        session.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=REQUEST_TIMEOUT)
-    except Exception as e:
-        logger.error(f"Telegram error: {e}")
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    # NOU: reincercam de 3 ori daca trimiterea esueaza (hiccup de retea, timeout,
+    # rate-limit temporar de la Telegram) - inainte, un singur esec insemna ca
+    # notificarea se pierdea definitiv, desi tranzactia pe Bitget reusea normal.
+    for attempt in range(1, 4):
+        try:
+            r = session.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 200:
+                return
+            logger.error(f"Telegram HTTP {r.status_code} (incercarea {attempt}/3): {r.text[:200]}")
+        except Exception as e:
+            logger.error(f"Telegram error (incercarea {attempt}/3): {e}")
+        if attempt < 3:
+            time.sleep(2 * attempt)  # backoff: 2s, apoi 4s
+    logger.error(f"❌ Mesaj Telegram PIERDUT definitiv dupa 3 incercari: {msg[:100]}")
 
 def sign(message, secret):
     mac = hmac.new(bytes(secret, encoding='utf8'), bytes(message, encoding='utf-8'), digestmod='sha256')
@@ -518,7 +528,7 @@ def run_bot():
     # format numeric {:.2f}, ceea ce arunca ValueError la fiecare pornire LIVE.
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v14 (fix critic: size vs funds) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v15 (Telegram retry) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"Features: ATR-Stops, Partial Profit, Macro Trend, Corelații Returns, Filtru BTC,\n"
                  f"Risc 2%, Expunere max {MAX_TOTAL_EXPOSURE_PCT*100:.0f}%, Daily DD max {MAX_DAILY_DRAWDOWN_PCT*100:.0f}%\n"
