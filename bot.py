@@ -104,6 +104,14 @@ BTC_DROP_THRESHOLD = 0.04       # BTC scazut >4% in ultimele BTC_DROP_LOOKBACK_H
 BTC_DROP_LOOKBACK_H = 4
 BTC_EMA_TOLERANCE = 0.99        # BTC trebuie sa fie aproape de/peste EMA50 1h
 
+# --- Fear & Greed Index (protectie suplimentara la frica extrema) ---
+# Foloseste API-ul public gratuit alternative.me, fara autentificare.
+# In frica extrema (index foarte mic), piata poate continua sa scada brusc
+# indiferent de semnalele tehnice locale - devenim mai precauti la cumparari.
+FEAR_GREED_ENABLED = True
+FEAR_GREED_EXTREME_THRESHOLD = 15   # sub acest prag = "frica extrema", blocam buy-uri noi
+FEAR_GREED_CACHE_MINUTES = 30       # indexul se schimba o data pe zi, nu are rost sa cerem des
+
 REQUEST_TIMEOUT = 10
 LOOP_INTERVAL = 120
 
@@ -510,6 +518,39 @@ def get_btc_health():
     return True, "BTC sanatos"
 
 
+# ---------------- FEAR & GREED INDEX ----------------
+_fear_greed_cache = {"value": None, "label": "", "timestamp": 0}
+
+def get_fear_greed():
+    """
+    Citeste Fear & Greed Index (0-100) de la alternative.me, API public gratuit.
+    Cache de FEAR_GREED_CACHE_MINUTES ca sa nu cerem la fiecare ciclu (indexul
+    se actualizeaza doar o data pe zi). Fail-open: daca cererea esueaza, nu
+    blocam botul, doar ignoram acest filtru pentru ciclul curent.
+    """
+    if not FEAR_GREED_ENABLED:
+        return None, "", True
+
+    now = time.time()
+    if _fear_greed_cache["value"] is not None and (now - _fear_greed_cache["timestamp"]) < FEAR_GREED_CACHE_MINUTES * 60:
+        v = _fear_greed_cache["value"]
+        return v, _fear_greed_cache["label"], v > FEAR_GREED_EXTREME_THRESHOLD
+
+    try:
+        r = session.get("https://api.alternative.me/fng/?limit=1", timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            if data:
+                value = int(data[0]["value"])
+                label = data[0].get("value_classification", "")
+                _fear_greed_cache.update(value=value, label=label, timestamp=now)
+                return value, label, value > FEAR_GREED_EXTREME_THRESHOLD
+    except Exception as e:
+        logger.warning(f"Fear&Greed indisponibil, ignor filtrul: {e}")
+
+    return None, "", True  # fail-open — nu blocam daca nu putem citi indexul
+
+
 # ---------------- BOT LOOP ----------------
 def run_bot():
     global virtual_balance, daily_realized_pnl, daily_pnl_date
@@ -528,9 +569,10 @@ def run_bot():
     # format numeric {:.2f}, ceea ce arunca ValueError la fiecare pornire LIVE.
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v15 (Telegram retry) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v16 (Fear&Greed + trailing prioritar) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"Features: ATR-Stops, Partial Profit, Macro Trend, Corelații Returns, Filtru BTC,\n"
+                 f"Fear&Greed filter, RSI nu mai taie trend-urile active,\n"
                  f"Risc 2%, Expunere max {MAX_TOTAL_EXPOSURE_PCT*100:.0f}%, Daily DD max {MAX_DAILY_DRAWDOWN_PCT*100:.0f}%\n"
                  f"Monitorizez: {', '.join(SYMBOLS)}")
     logger.info(start_msg)
@@ -557,6 +599,11 @@ def run_bot():
             btc_healthy, btc_reason = get_btc_health()
             if not btc_healthy:
                 logger.info(f"🚫 Filtru BTC activ: {btc_reason} — nu cumpar niciun altcoin in acest ciclu.")
+
+            # NOU: verificam Fear & Greed Index o singura data pe ciclu.
+            fg_value, fg_label, fg_ok = get_fear_greed()
+            if fg_value is not None:
+                logger.info(f"😨 Fear&Greed: {fg_value} ({fg_label}){' — FRICA EXTREMA, precautie la buy' if not fg_ok else ''}")
 
             for symbol in SYMBOLS:
                 try:
@@ -604,13 +651,14 @@ def run_bot():
                         vwap_ok = price < vwap * 1.01 if vwap else True
                         corr_ok = check_correlation_filter(symbol)
 
-                        all_ok = (not dd_blocked and btc_healthy and macro_uptrend and ema_ok and not in_cooldown
+                        all_ok = (not dd_blocked and btc_healthy and fg_ok and macro_uptrend and ema_ok and not in_cooldown
                                   and rsi_ok and volume_ok and spread_ok and vwap_ok and corr_ok)
 
                         if not all_ok:
                             blocked = []
                             if dd_blocked: blocked.append("daily-drawdown")
                             if not btc_healthy: blocked.append(f"BTC({btc_reason})")
+                            if not fg_ok: blocked.append(f"FearGreed({fg_value})")
                             if not macro_uptrend: blocked.append("macro4h")
                             if not ema_ok: blocked.append("EMA1h")
                             if in_cooldown: blocked.append("cooldown")
@@ -703,7 +751,15 @@ def run_bot():
                             should_sell, reason = True, f"🔒 Stop protejat (PnL: {pnl_pct*100:.1f}%)"
                         elif peak_pnl >= TRAILING_TRIGGER and drop_from_peak >= TRAILING_DISTANCE:
                             should_sell, reason = True, f"📉 Trailing (Vârf: +{peak_pnl*100:.1f}%, Acum: +{pnl_pct*100:.1f}%)"
-                        elif rsi_15m > RSI_SELL and drop_from_peak >= RSI_SELL_MIN_DROP_FROM_PEAK:
+                        # NOU: RSI poate forta vanzarea DOAR daca trailing stop-ul inca
+                        # nu s-a "armat" (peak_pnl < TRAILING_TRIGGER) - adica pozitia
+                        # inca nu a demonstrat un trend real de crestere. Odata ce
+                        # trailing-ul e activ, lasam DOAR trailing/stop-loss/breakeven
+                        # sa decida iesirea - inainte, RSI>65 vindea la doar 0.3%
+                        # scadere de la varf chiar si intr-un trend bun, taind
+                        # castiguri mari si generand tranzactii/comisioane inutile.
+                        elif (peak_pnl < TRAILING_TRIGGER and rsi_15m > RSI_SELL
+                              and drop_from_peak >= RSI_SELL_MIN_DROP_FROM_PEAK):
                             should_sell, reason = True, f"📊 RSI={rsi_15m} > {RSI_SELL}"
                         else:
                             opened_dt = datetime.fromisoformat(pos["opened_at"])
