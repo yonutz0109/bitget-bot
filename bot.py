@@ -112,6 +112,14 @@ FEAR_GREED_ENABLED = True
 FEAR_GREED_EXTREME_THRESHOLD = 15   # sub acest prag = "frica extrema", blocam buy-uri noi
 FEAR_GREED_CACHE_MINUTES = 30       # indexul se schimba o data pe zi, nu are rost sa cerem des
 
+# --- Filtru piata generala crypto (nu doar BTC individual) ---
+# Foloseste CoinGecko API public gratuit (/global), fara autentificare.
+# Chiar daca BTC arata bine local, daca toata piata crypto scade puternic
+# in ultimele 24h, e un semnal ca sentimentul general e negativ.
+MARKET_TREND_ENABLED = True
+MARKET_DROP_THRESHOLD = 0.03        # capitalizarea totala scazuta >3% in 24h = precautie
+MARKET_TREND_CACHE_MINUTES = 15
+
 REQUEST_TIMEOUT = 10
 LOOP_INTERVAL = 120
 
@@ -153,6 +161,67 @@ def send_telegram(msg):
         if attempt < 3:
             time.sleep(2 * attempt)  # backoff: 2s, apoi 4s
     logger.error(f"❌ Mesaj Telegram PIERDUT definitiv dupa 3 incercari: {msg[:100]}")
+
+def check_telegram_commands():
+    """
+    Verifica o data pe ciclu daca a venit o comanda noua pe Telegram (/pause
+    sau /resume). Foloseste getUpdates cu offset ca sa nu reproceseze mesaje
+    vechi. Doar mesajele din chat-ul configurat (TELEGRAM_CHAT_ID) sunt
+    acceptate - orice altcineva scrie botului e ignorat, ca masura de siguranta.
+    """
+    global bot_paused, telegram_last_update_id
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+        params = {"offset": telegram_last_update_id + 1, "timeout": 0, "limit": 20}
+        r = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            return
+
+        results = r.json().get("result", [])
+        for update in results:
+            telegram_last_update_id = max(telegram_last_update_id, update.get("update_id", 0))
+            msg = update.get("message", {})
+            chat_id = str(msg.get("chat", {}).get("id", ""))
+            text = msg.get("text", "").strip().lower()
+            msg_date = msg.get("date", 0)
+
+            if chat_id != str(TELEGRAM_CHAT_ID):
+                continue  # ignoram mesaje din alte chat-uri
+
+            # NOU: ignoram comenzi trimise INAINTE de pornirea curenta a botului -
+            # fara volum persistent, offset-ul se poate reseta la redeploy, iar
+            # fara asta un /pause vechi din trecut ar putea "reveni" din greseala.
+            if msg_date and msg_date < bot_start_time - 5:
+                continue
+
+            if text in ("/pause", "pauza", "/pauza"):
+                if not bot_paused:
+                    bot_paused = True
+                    logger.info("⏸️ Bot PAUZAT manual prin Telegram.")
+                    send_telegram("⏸️ Bot pauzat. Nu mai deschid poziții noi.\nPozițiile existente rămân gestionate normal (stop-loss/trailing active).\nScrie /resume ca să reiau.")
+                else:
+                    send_telegram("⏸️ Botul e deja pauzat.")
+
+            elif text in ("/resume", "reia", "/reia", "/start_bot"):
+                if bot_paused:
+                    bot_paused = False
+                    logger.info("▶️ Bot REPORNIT manual prin Telegram.")
+                    send_telegram("▶️ Bot repornit. Reiau căutarea de oportunități noi.")
+                else:
+                    send_telegram("▶️ Botul rulează deja normal.")
+
+            elif text in ("/status",):
+                mode_txt = "⏸️ PAUZAT" if bot_paused else "▶️ ACTIV"
+                send_telegram(f"{mode_txt}\nPoziții deschise: {len(positions)}/{MAX_CONCURRENT_POSITIONS}\nPnL azi: {daily_realized_pnl:+.2f} USDT")
+
+        if results:
+            save_state()  # persistam offset-ul si starea de pauza imediat
+
+    except Exception as e:
+        logger.warning(f"Telegram getUpdates eroare (ignor, reincerc urmatorul ciclu): {e}")
 
 def sign(message, secret):
     mac = hmac.new(bytes(secret, encoding='utf8'), bytes(message, encoding='utf-8'), digestmod='sha256')
@@ -199,6 +268,9 @@ price_history = {}
 virtual_balance = None  # Pentru DRY_RUN
 daily_realized_pnl = 0.0   # NOU: suma PnL realizat (net) azi
 daily_pnl_date = None      # NOU: ziua curenta (string YYYY-MM-DD), pt reset
+bot_paused = False              # NOU: pauza manuala prin comanda Telegram /pause
+telegram_last_update_id = 0     # NOU: offset pentru getUpdates, evita reprocesarea mesajelor vechi
+bot_start_time = 0.0            # NOU: timestamp pornire, ignoram comenzi Telegram mai vechi
 
 def update_heartbeat(status="ok", extra=None):
     try:
@@ -207,7 +279,7 @@ def update_heartbeat(status="ok", extra=None):
     except Exception as e: logger.error(f"Heartbeat error: {e}")
 
 def load_state():
-    global positions, last_sell_time, price_history, virtual_balance, daily_realized_pnl, daily_pnl_date
+    global positions, last_sell_time, price_history, virtual_balance, daily_realized_pnl, daily_pnl_date, bot_paused, telegram_last_update_id
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f: saved = json.load(f)
@@ -216,9 +288,11 @@ def load_state():
             virtual_balance = saved.get("virtual_balance", None)
             daily_realized_pnl = saved.get("daily_realized_pnl", 0.0)
             daily_pnl_date = saved.get("daily_pnl_date", None)
+            bot_paused = saved.get("bot_paused", False)
+            telegram_last_update_id = saved.get("telegram_last_update_id", 0)
             ph_raw = saved.get("price_history", {})
             price_history = {k: deque(v, maxlen=CORRELATION_WINDOW*2) for k, v in ph_raw.items()}
-            logger.info(f"Stare încărcată: {len(positions)} poziții")
+            logger.info(f"Stare încărcată: {len(positions)} poziții" + (" | ⏸️ PAUZAT" if bot_paused else ""))
         except Exception as e:
             logger.error(f"Nu am putut încărca starea: {e}")
             positions, last_sell_time, price_history = {}, {}, {}
@@ -232,6 +306,8 @@ def save_state():
             "virtual_balance": virtual_balance,
             "daily_realized_pnl": daily_realized_pnl,
             "daily_pnl_date": daily_pnl_date,
+            "bot_paused": bot_paused,
+            "telegram_last_update_id": telegram_last_update_id,
             "price_history": {k: list(v) for k, v in price_history.items()}
         }
         with open(tmp, "w") as f: json.dump(state, f, indent=2)
@@ -551,9 +627,44 @@ def get_fear_greed():
     return None, "", True  # fail-open — nu blocam daca nu putem citi indexul
 
 
+# ---------------- FILTRU PIATA GENERALA ----------------
+_market_cache = {"change_24h": None, "timestamp": 0}
+
+def get_market_health():
+    """
+    Citeste variatia 24h a capitalizarii TOTALE a pietei crypto de la CoinGecko
+    (API public, gratuit, fara cheie). Diferit de filtrul BTC - aici verificam
+    toata piata, nu doar o singura moneda. Fail-open la eroare, la fel ca
+    restul filtrelor de context.
+    """
+    if not MARKET_TREND_ENABLED:
+        return True, ""
+
+    now = time.time()
+    if _market_cache["change_24h"] is not None and (now - _market_cache["timestamp"]) < MARKET_TREND_CACHE_MINUTES * 60:
+        change = _market_cache["change_24h"]
+        ok = change > -MARKET_DROP_THRESHOLD * 100
+        return ok, f"piata totala {change:+.1f}% in 24h"
+
+    try:
+        r = session.get("https://api.coingecko.com/api/v3/global", timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            data = r.json().get("data", {})
+            change = data.get("market_cap_change_percentage_24h_usd")
+            if change is not None:
+                _market_cache.update(change_24h=change, timestamp=now)
+                ok = change > -MARKET_DROP_THRESHOLD * 100
+                return ok, f"piata totala {change:+.1f}% in 24h"
+    except Exception as e:
+        logger.warning(f"Piata generala indisponibila, ignor filtrul: {e}")
+
+    return True, ""  # fail-open
+
+
 # ---------------- BOT LOOP ----------------
 def run_bot():
-    global virtual_balance, daily_realized_pnl, daily_pnl_date
+    global virtual_balance, daily_realized_pnl, daily_pnl_date, bot_start_time
+    bot_start_time = time.time()  # NOU: folosit ca sa ignoram comenzi Telegram vechi la (re)pornire
     mode = "🧪 DRY RUN" if DRY_RUN else "💰 LIVE"
     load_symbol_precision()
     load_state()
@@ -569,10 +680,11 @@ def run_bot():
     # format numeric {:.2f}, ceea ce arunca ValueError la fiecare pornire LIVE.
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v16 (Fear&Greed + trailing prioritar) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v17 (Regim TREND, Piață generală, /pause) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"Features: ATR-Stops, Partial Profit, Macro Trend, Corelații Returns, Filtru BTC,\n"
-                 f"Fear&Greed filter, RSI nu mai taie trend-urile active,\n"
+                 f"Fear&Greed, Piață generală (CoinGecko), Regim TREND obligatoriu,\n"
+                 f"Comenzi: /pause /resume /status\n"
                  f"Risc 2%, Expunere max {MAX_TOTAL_EXPOSURE_PCT*100:.0f}%, Daily DD max {MAX_DAILY_DRAWDOWN_PCT*100:.0f}%\n"
                  f"Monitorizez: {', '.join(SYMBOLS)}")
     logger.info(start_msg)
@@ -581,13 +693,15 @@ def run_bot():
     while True:
         try:
             update_heartbeat("ok", {"loop": "start"})
+            check_telegram_commands()  # NOU: verificam /pause, /resume, /status
             check_and_reset_daily_pnl()
             usdt_balance = get_spot_balance("USDT")
             total_equity = get_total_equity(usdt_balance)
 
             dd_blocked = daily_drawdown_exceeded(total_equity)
             logger.info(f"💰 USDT: ${usdt_balance:.2f} | Equity: ${total_equity:.2f} | Pozitii: {len(positions)}/{MAX_CONCURRENT_POSITIONS} | "
-                       f"PnL azi: {daily_realized_pnl:+.2f} USDT{' | 🛑 DAILY DRAWDOWN ATINS' if dd_blocked else ''}")
+                       f"PnL azi: {daily_realized_pnl:+.2f} USDT{' | 🛑 DAILY DRAWDOWN ATINS' if dd_blocked else ''}"
+                       f"{' | ⏸️ PAUZAT' if bot_paused else ''}")
 
             for sym in SYMBOLS:
                 p = get_current_price(sym)
@@ -604,6 +718,11 @@ def run_bot():
             fg_value, fg_label, fg_ok = get_fear_greed()
             if fg_value is not None:
                 logger.info(f"😨 Fear&Greed: {fg_value} ({fg_label}){' — FRICA EXTREMA, precautie la buy' if not fg_ok else ''}")
+
+            # NOU: verificam sanatatea pietei generale crypto o singura data pe ciclu.
+            mkt_ok, mkt_reason = get_market_health()
+            if not mkt_ok:
+                logger.info(f"🚫 Piata generala slaba: {mkt_reason} — precautie la buy-uri noi.")
 
             for symbol in SYMBOLS:
                 try:
@@ -651,14 +770,23 @@ def run_bot():
                         vwap_ok = price < vwap * 1.01 if vwap else True
                         corr_ok = check_correlation_filter(symbol)
 
-                        all_ok = (not dd_blocked and btc_healthy and fg_ok and macro_uptrend and ema_ok and not in_cooldown
-                                  and rsi_ok and volume_ok and spread_ok and vwap_ok and corr_ok)
+                        # NOU: regim TREND obligatoriu la cumparare, bazat pe date reale din
+                        # trades.csv - tranzactiile facute in regim RANGE (ADX mic, piata fara
+                        # directie clara) au avut rata de pierdere mult mai mare (ex. BGB: 3
+                        # pierderi din 4 tranzactii, toate in RANGE) fata de cele in TREND.
+                        regime_ok = (regime == "TREND")
+
+                        all_ok = (not bot_paused and not dd_blocked and btc_healthy and fg_ok and mkt_ok and macro_uptrend and ema_ok
+                                  and not in_cooldown and rsi_ok and volume_ok and spread_ok and vwap_ok
+                                  and corr_ok and regime_ok)
 
                         if not all_ok:
                             blocked = []
+                            if bot_paused: blocked.append("PAUZAT-manual")
                             if dd_blocked: blocked.append("daily-drawdown")
                             if not btc_healthy: blocked.append(f"BTC({btc_reason})")
                             if not fg_ok: blocked.append(f"FearGreed({fg_value})")
+                            if not mkt_ok: blocked.append(f"piata-generala({mkt_reason})")
                             if not macro_uptrend: blocked.append("macro4h")
                             if not ema_ok: blocked.append("EMA1h")
                             if in_cooldown: blocked.append("cooldown")
@@ -667,6 +795,7 @@ def run_bot():
                             if not spread_ok: blocked.append("spread")
                             if not vwap_ok: blocked.append("VWAP")
                             if not corr_ok: blocked.append("corelatie")
+                            if not regime_ok: blocked.append("regim-RANGE")
                             if blocked:
                                 logger.info(f"⏸️ {symbol}: nu cumpar — blocat de: {', '.join(blocked)}")
 
