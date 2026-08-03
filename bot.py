@@ -40,6 +40,19 @@ RSI_MIN_1H = 32
 RSI_MAX_1H = 60
 RSI_SELL = 65
 
+# --- Strategie Momentum (a doua cale de intrare, separata de mean-reversion) ---
+# Mean-reversion (existent) cumpara "ieftin" - RSI scazut, pret sub VWAP.
+# Momentum (nou) cumpara "in forta" - pret care sparge un maxim local recent,
+# cu RSI moderat-ridicat (nu supracumparat) si volum/trend confirmate.
+# Cele doua NU se contrazic: sunt cai alternative catre acelasi set de filtre
+# de siguranta (BTC, piata, regim, drawdown) - niciodata simultan pe aceeasi
+# decizie, doar "OR" intre ele la semnalul de intrare.
+MOMENTUM_ENABLED = True
+RSI_MOMENTUM_MIN = 52          # peste 52 - nu mai e "ieftin", e in miscare
+RSI_MOMENTUM_MAX = 62          # sub 62 - inca sub pragul de vanzare (65), spatiu de crestere
+MOMENTUM_BREAKOUT_LOOKBACK = 10  # cate candele 15m in urma verificam pentru maxim local
+MOMENTUM_BREAKOUT_MARGIN = 0.001 # pretul trebuie sa depaseasca maximul cu minim 0.1%
+
 EMA_TOLERANCE = 0.985
 EMA_PERIOD_TREND = 50  # pe 1h
 EMA_PERIOD_MACRO = 50  # pe 4h pentru filtru macro
@@ -680,11 +693,11 @@ def run_bot():
     # format numeric {:.2f}, ceea ce arunca ValueError la fiecare pornire LIVE.
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v17 (Regim TREND, Piață generală, /pause) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v18 (+ Strategie Momentum) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"Features: ATR-Stops, Partial Profit, Macro Trend, Corelații Returns, Filtru BTC,\n"
                  f"Fear&Greed, Piață generală (CoinGecko), Regim TREND obligatoriu,\n"
-                 f"Comenzi: /pause /resume /status\n"
+                 f"🔻 Mean-reversion + 🚀 Momentum (breakout), Comenzi: /pause /resume /status\n"
                  f"Risc 2%, Expunere max {MAX_TOTAL_EXPOSURE_PCT*100:.0f}%, Daily DD max {MAX_DAILY_DRAWDOWN_PCT*100:.0f}%\n"
                  f"Monitorizez: {', '.join(SYMBOLS)}")
     logger.info(start_msg)
@@ -763,11 +776,6 @@ def run_bot():
                         if len(positions) >= MAX_CONCURRENT_POSITIONS: continue
 
                         in_cooldown = symbol in last_sell_time and (time.time() - last_sell_time[symbol]) / 60 < COOLDOWN_MINUTES
-                        rsi_ok = rsi_15m < RSI_BUY_15M and RSI_MIN_1H < rsi_1h < RSI_MAX_1H
-                        if regime == "TREND" and adx and adx > 30:
-                            rsi_ok = rsi_15m < RSI_BUY_15M + 5 and rsi_1h < RSI_MAX_1H + 5
-
-                        vwap_ok = price < vwap * 1.01 if vwap else True
                         corr_ok = check_correlation_filter(symbol)
 
                         # NOU: regim TREND obligatoriu la cumparare, bazat pe date reale din
@@ -776,9 +784,30 @@ def run_bot():
                         # pierderi din 4 tranzactii, toate in RANGE) fata de cele in TREND.
                         regime_ok = (regime == "TREND")
 
+                        # ---- Calea 1: MEAN-REVERSION (existent) - cumpara "ieftin" ----
+                        mean_rev_rsi_ok = rsi_15m < RSI_BUY_15M and RSI_MIN_1H < rsi_1h < RSI_MAX_1H
+                        if regime == "TREND" and adx and adx > 30:
+                            mean_rev_rsi_ok = rsi_15m < RSI_BUY_15M + 5 and rsi_1h < RSI_MAX_1H + 5
+                        mean_rev_vwap_ok = price < vwap * 1.01 if vwap else True
+                        mean_rev_ok = mean_rev_rsi_ok and mean_rev_vwap_ok
+
+                        # ---- Calea 2: MOMENTUM (nou) - cumpara "in forta" ----
+                        # Pretul sparge maximul ultimelor MOMENTUM_BREAKOUT_LOOKBACK candele 15m,
+                        # cu RSI moderat-ridicat (nu supracumparat) - prinde zile de crestere
+                        # clara, unde mean-reversion sta pe margine pentru ca RSI nu e scazut.
+                        momentum_ok = False
+                        if MOMENTUM_ENABLED and len(closes_15m) > MOMENTUM_BREAKOUT_LOOKBACK:
+                            recent_high = max(closes_15m[-(MOMENTUM_BREAKOUT_LOOKBACK + 1):-1])
+                            breakout_ok = price > recent_high * (1 + MOMENTUM_BREAKOUT_MARGIN)
+                            momentum_rsi_ok = (RSI_MOMENTUM_MIN < rsi_15m < RSI_MOMENTUM_MAX
+                                                and RSI_MIN_1H < rsi_1h < RSI_MAX_1H)
+                            momentum_ok = breakout_ok and momentum_rsi_ok
+
+                        entry_ok = mean_rev_ok or momentum_ok
+                        entry_strategy = "momentum" if (momentum_ok and not mean_rev_ok) else "mean-reversion"
+
                         all_ok = (not bot_paused and not dd_blocked and btc_healthy and fg_ok and mkt_ok and macro_uptrend and ema_ok
-                                  and not in_cooldown and rsi_ok and volume_ok and spread_ok and vwap_ok
-                                  and corr_ok and regime_ok)
+                                  and not in_cooldown and volume_ok and spread_ok and corr_ok and regime_ok and entry_ok)
 
                         if not all_ok:
                             blocked = []
@@ -790,10 +819,9 @@ def run_bot():
                             if not macro_uptrend: blocked.append("macro4h")
                             if not ema_ok: blocked.append("EMA1h")
                             if in_cooldown: blocked.append("cooldown")
-                            if not rsi_ok: blocked.append("RSI")
+                            if not entry_ok: blocked.append(f"semnal(meanrev:{mean_rev_ok},momentum:{momentum_ok})")
                             if not volume_ok: blocked.append("volum")
                             if not spread_ok: blocked.append("spread")
-                            if not vwap_ok: blocked.append("VWAP")
                             if not corr_ok: blocked.append("corelatie")
                             if not regime_ok: blocked.append("regim-RANGE")
                             if blocked:
@@ -835,10 +863,11 @@ def run_bot():
                                         "price": price, "quantity": real_qty, "peak": price,
                                         "opened_at": datetime.now().isoformat(),
                                         "breakeven_activated": False, "partial_sold": False,
-                                        "stop_pct": stop_pct
+                                        "stop_pct": stop_pct, "entry_strategy": entry_strategy
                                     }
                                     save_state()
-                                    msg = (f"🟢 BUY {symbol}\n💵 ${trade_amount:.2f} la ${price:.4f}\n"
+                                    strat_emoji = "🚀" if entry_strategy == "momentum" else "🔻"
+                                    msg = (f"🟢 BUY {symbol} {strat_emoji} {entry_strategy}\n💵 ${trade_amount:.2f} la ${price:.4f}\n"
                                            f"📊 RSI={rsi_15m}, ADX={adx}, Stop={stop_pct*100:.1f}%\n"
                                            f"{'🧪 SIM' if DRY_RUN else '💰 REAL'}")
                                     logger.info(msg); send_telegram(msg)
