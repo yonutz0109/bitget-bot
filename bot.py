@@ -38,7 +38,9 @@ RSI_PERIOD = 14
 RSI_BUY_15M = 45
 RSI_MIN_1H = 32
 RSI_MAX_1H = 60
-RSI_SELL = 65
+RSI_SELL = 70  # NOU: crescut de la 65 - datele au aratat iesiri premature (ETH, ADA)
+                # la miscari mici de pret, inainte ca trailing stop sa apuce sa se
+                # activeze; 70 lasa mai mult "spatiu de respiratie" pozitiei
 
 # --- Strategie Momentum (a doua cale de intrare, separata de mean-reversion) ---
 # Mean-reversion (existent) cumpara "ieftin" - RSI scazut, pret sub VWAP.
@@ -55,7 +57,9 @@ MOMENTUM_BREAKOUT_MARGIN = 0.001 # pretul trebuie sa depaseasca maximul cu minim
 
 EMA_TOLERANCE = 0.985
 EMA_PERIOD_TREND = 50  # pe 1h
-EMA_PERIOD_MACRO = 50  # pe 4h pentru filtru macro
+EMA_PERIOD_MACRO = 30  # NOU: redus de la 50 - media pe 4h era prea lenta, bloca
+                        # cumparari ore intregi dupa ce un trend nou incepea deja
+                        # (vezi BTC 04.08: macro4h a blocat de dimineata pana dupa-amiaza)
 
 # --- Risk Management (Dinamic cu ATR) ---
 RISK_PER_TRADE = 0.02          # redus de la 5% la 2% - 5% e prea mult pt un bot
@@ -693,9 +697,9 @@ def run_bot():
     # format numeric {:.2f}, ceea ce arunca ValueError la fiecare pornire LIVE.
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v18 (+ Strategie Momentum) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v19 (RSI_SELL 70, EMA4h mai rapid) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
-                 f"Features: ATR-Stops, Partial Profit, Macro Trend, Corelații Returns, Filtru BTC,\n"
+                 f"Features: ATR-Stops, Partial Profit, Macro Trend(EMA30), Corelații Returns, Filtru BTC,\n"
                  f"Fear&Greed, Piață generală (CoinGecko), Regim TREND obligatoriu,\n"
                  f"🔻 Mean-reversion + 🚀 Momentum (breakout), Comenzi: /pause /resume /status\n"
                  f"Risc 2%, Expunere max {MAX_TOTAL_EXPOSURE_PCT*100:.0f}%, Daily DD max {MAX_DAILY_DRAWDOWN_PCT*100:.0f}%\n"
