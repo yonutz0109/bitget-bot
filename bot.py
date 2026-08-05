@@ -367,6 +367,36 @@ def get_spot_balance(coin="USDT"):
             if asset["coin"] == coin: return float(asset["available"])
     return 0.0
 
+# NOU: reconciliere pozitie <-> balanta reala. Cand un SELL esueaza cu eroare
+# de balanta insuficienta, inainte botul reincerca orbeste la fiecare ciclu
+# (la 2 minute) cu aceeasi cantitate interna gresita, la infinit - asta a
+# cauzat spam-ul de erori "Insufficient balance" pe ADAUSDT. Acum verificam
+# balanta REALA de pe Bitget si corectam sau stergem pozitia din stare.
+def reconcile_position_balance(symbol, coin, pos):
+    real_balance = get_spot_balance(coin)
+    tracked_qty = pos["quantity"]
+
+    if real_balance <= 0:
+        logger.warning(f"⚠️ {symbol}: balanta reala {coin}=0, dar pozitia interna avea qty={tracked_qty}. Sterg pozitia (desincronizata).")
+        send_telegram(
+            f"⚠️ {symbol}: Poziție desincronizată detectată — balanța reală de {coin} e 0, "
+            f"dar botul credea că are {tracked_qty}. Am șters poziția din evidența internă "
+            f"(fără să înregistrez PnL - verifică manual istoricul de tranzacții pe Bitget)."
+        )
+        return None  # semnaleaza ca pozitia trebuie stearsa complet
+
+    diff_ratio = abs(real_balance - tracked_qty) / max(tracked_qty, 1e-9)
+    if diff_ratio > 0.01:
+        logger.warning(f"⚠️ {symbol}: qty interna {tracked_qty} != balanta reala {real_balance}. Corectez.")
+        send_telegram(
+            f"⚠️ {symbol}: Am corectat cantitatea internă de la {tracked_qty} "
+            f"la balanța reală {real_balance:.6f} {coin} (SELL eșuase din cauza dezacordului)."
+        )
+        pos["quantity"] = real_balance
+        save_state()
+
+    return pos["quantity"]
+
 def get_candles(symbol, granularity="15min", limit=150):
     path = f"/api/v2/spot/market/candles?symbol={symbol}&granularity={granularity}&limit={limit}"
     data = safe_request("GET", BASE_URL + path)
@@ -697,11 +727,12 @@ def run_bot():
     # format numeric {:.2f}, ceea ce arunca ValueError la fiecare pornire LIVE.
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v19 (RSI_SELL 70, EMA4h mai rapid) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v20 (fix reconciliere SELL esuat) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"Features: ATR-Stops, Partial Profit, Macro Trend(EMA30), Corelații Returns, Filtru BTC,\n"
                  f"Fear&Greed, Piață generală (CoinGecko), Regim TREND obligatoriu,\n"
-                 f"🔻 Mean-reversion + 🚀 Momentum (breakout), Comenzi: /pause /resume /status\n"
+                 f"🔻 Mean-reversion + 🚀 Momentum (breakout), Reconciliere balanță la SELL eșuat,\n"
+                 f"Comenzi: /pause /resume /status\n"
                  f"Risc 2%, Expunere max {MAX_TOTAL_EXPOSURE_PCT*100:.0f}%, Daily DD max {MAX_DAILY_DRAWDOWN_PCT*100:.0f}%\n"
                  f"Monitorizez: {', '.join(SYMBOLS)}")
     logger.info(start_msg)
@@ -903,6 +934,10 @@ def run_bot():
                                     if DRY_RUN: virtual_balance += half_qty * price * 0.999
                                     send_telegram(f"💸 {symbol}: Vândut 50% la +{pnl_pct*100:.1f}%")
                                     save_state()
+                                elif not DRY_RUN:
+                                    # NOU: acelasi fix de reconciliere si pentru vanzarea partiala
+                                    logger.error(f"❌ Eroare partial SELL {symbol}: {r}")
+                                    reconcile_position_balance(symbol, coin, pos)
 
                         should_sell, reason = False, ""
                         stop_pct = pos.get("stop_pct", 0.025)
@@ -957,8 +992,25 @@ def run_bot():
                                     del positions[symbol]
                                     save_state()
                                 else:
+                                    error_msg = result.get('msg', 'necunoscut')
                                     logger.error(f"❌ Eroare SELL: {result}")
-                                    send_telegram(f"❌ Eroare SELL {symbol}: {result.get('msg', 'necunoscut')}")
+
+                                    # NOU: FIX principal — inainte, orice esec la SELL era doar
+                                    # logat si botul reincerca orbeste aceeasi cantitate la
+                                    # fiecare ciclu (2 min), la infinit, ceea ce a cauzat spam-ul
+                                    # de erori "Insufficient balance" pe ADAUSDT. Acum, la o
+                                    # eroare de balanta, verificam balanta REALA de pe Bitget si
+                                    # fie corectam cantitatea interna (se va reincerca automat
+                                    # cu valoarea corecta la ciclul urmator), fie stergem
+                                    # pozitia daca balanta reala e zero (desincronizare completa).
+                                    if not DRY_RUN and ("insufficient" in error_msg.lower() or "balance" in error_msg.lower()):
+                                        corrected = reconcile_position_balance(symbol, coin, pos)
+                                        if corrected is None:
+                                            last_sell_time[symbol] = time.time()
+                                            del positions[symbol]
+                                            save_state()
+                                    else:
+                                        send_telegram(f"❌ Eroare SELL {symbol}: {error_msg}")
                             else:
                                 last_sell_time[symbol] = time.time()
                                 del positions[symbol]
