@@ -25,10 +25,25 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 
 BASE_URL = "https://api.bitget.com"
-STATE_FILE = "bot_state.json"
-LOG_FILE = "bot.log"
-HEARTBEAT_FILE = "heartbeat.json"
-TRADES_CSV = "trades.csv"
+
+# v22: fisierele de stare se scriu intr-un director configurabil prin variabila
+# de mediu DATA_DIR. Pe Northflank atasam un volum persistent montat la /data
+# si setam DATA_DIR=/data - altfel, la fiecare redeploy filesystem-ul se
+# reseteaza, bot_state.json dispare, iar pozitiile deschise raman "orfane":
+# botul uita de ele (fara stop-loss, fara trailing) si poate chiar recumpara
+# aceeasi moneda crezand ca nu are pozitie. Exact asta s-a intamplat cu UNI.
+# Daca DATA_DIR nu e setat, se foloseste directorul curent (comportament vechi).
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception as _e:
+    print(f"ATENTIE: nu pot crea {DATA_DIR} ({_e}), folosesc directorul curent.")
+    DATA_DIR = "."
+
+STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
+LOG_FILE = os.path.join(DATA_DIR, "bot.log")
+HEARTBEAT_FILE = os.path.join(DATA_DIR, "heartbeat.json")
+TRADES_CSV = os.path.join(DATA_DIR, "trades.csv")
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "BGBUSDT", "UNIUSDT", "DOGEUSDT",
            "SOLUSDT", "ADAUSDT", "LINKUSDT"]
@@ -727,8 +742,9 @@ def run_bot():
 
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v21 (filtre relaxate, mai agil la cumpărare) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v22 (stare persistentă) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
+                 f"💾 Date salvate în: {DATA_DIR}{' ✅ persistent' if DATA_DIR != '.' else ' ⚠️ EFEMER - se pierde la redeploy!'}\n"
                  f"Schimbări v21:\n"
                  f"• Volum: măsurat pe candela ÎNCHISĂ (bug reparat), prag {MIN_VOLUME_RATIO}\n"
                  f"• Regim: TREND nu mai e obligatoriu (ADX>{ADX_TREND_THRESHOLD}); în RANGE intru cu poziție {RANGE_SIZE_MULTIPLIER*100:.0f}%\n"
