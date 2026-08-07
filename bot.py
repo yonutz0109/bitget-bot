@@ -95,6 +95,22 @@ BREAKEVEN_DISTANCE = 0.005
 PARTIAL_PROFIT_TRIGGER = 0.025
 RSI_SELL_MIN_DROP_FROM_PEAK = 0.003
 
+# v23: BUG DE LOGICA REPARAT. Regula "RSI > 70 -> vinde" nu verifica deloc daca
+# pozitia e pe profit. Ce se intampla in practica (confirmat de trades.csv):
+# botul cumpara cu RSI jos (36-44), pretul urca putin - destul cat RSI sa sara
+# peste 70, dar NU destul cat sa acopere pretul de intrare + comisioane. Apoi la
+# o scadere de doar 0.3% de la varf, regula RSI inchide pozitia... in pierdere.
+#   UNI:  intrare 4.059  -> iesire 4.031  = -0.69%  (motiv: RSI 72.41 > 70)
+#   ADA:  intrare 0.189  -> iesire 0.1886 = -0.21%  (motiv: RSI 70.64 > 70)
+# Ambele inchise de RSI, ambele pe minus. Nu e ghinion, e o regula care vinde
+# "pentru ca e supracumparat" chiar cand TU esti sub pretul de intrare - moment
+# in care nu exista niciun profit de protejat.
+# Fix: RSI poate inchide pozitia DOAR daca PnL-ul NET (dupa comisioane dus-intors)
+# e pozitiv. Sub acel prag, lasam stop-loss-ul sa decida - el exista exact pentru
+# cazul in care lucrurile merg prost.
+RSI_SELL_REQUIRES_PROFIT = True
+RSI_SELL_MIN_NET_PROFIT = 0.002   # PnL net minim ca RSI sa aiba voie sa vanda (0.2%)
+
 # --- Time & Position ---
 COOLDOWN_MINUTES = 45
 MAX_CONCURRENT_POSITIONS = 3
@@ -742,10 +758,12 @@ def run_bot():
 
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v22 (stare persistentă) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v23 (RSI nu mai vinde în pierdere) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"💾 Date salvate în: {DATA_DIR}{' ✅ persistent' if DATA_DIR != '.' else ' ⚠️ EFEMER - se pierde la redeploy!'}\n"
-                 f"Schimbări v21:\n"
+                 f"🔧 v23: RSI>70 închide poziția DOAR dacă e pe profit net (min +{RSI_SELL_MIN_NET_PROFIT*100:.1f}%).\n"
+                 f"   Înainte vindea și în pierdere — a cauzat 2 ieșiri pe minus (UNI -0.7%, ADA -0.2%).\n"
+                 f"Restul (v21):\n"
                  f"• Volum: măsurat pe candela ÎNCHISĂ (bug reparat), prag {MIN_VOLUME_RATIO}\n"
                  f"• Regim: TREND nu mai e obligatoriu (ADX>{ADX_TREND_THRESHOLD}); în RANGE intru cu poziție {RANGE_SIZE_MULTIPLIER*100:.0f}%\n"
                  f"• Momentum: RSI 15m {RSI_MOMENTUM_MIN}-{RSI_MOMENTUM_MAX}, breakout pe MAXIME reale\n"
@@ -984,10 +1002,21 @@ def run_bot():
                             should_sell, reason = True, f"🔒 Stop protejat (PnL: {pnl_pct*100:.1f}%)"
                         elif peak_pnl >= TRAILING_TRIGGER and drop_from_peak >= TRAILING_DISTANCE:
                             should_sell, reason = True, f"📉 Trailing (Vârf: +{peak_pnl*100:.1f}%, Acum: +{pnl_pct*100:.1f}%)"
+                        # v23: conditia noua - RSI vinde doar daca suntem efectiv pe
+                        # profit net. Vezi comentariul de la RSI_SELL_REQUIRES_PROFIT.
                         elif (peak_pnl < TRAILING_TRIGGER and rsi_15m > RSI_SELL
-                              and drop_from_peak >= RSI_SELL_MIN_DROP_FROM_PEAK):
-                            should_sell, reason = True, f"📊 RSI={rsi_15m} > {RSI_SELL}"
+                              and drop_from_peak >= RSI_SELL_MIN_DROP_FROM_PEAK
+                              and (not RSI_SELL_REQUIRES_PROFIT
+                                   or net_pnl_pct(pnl_pct) >= RSI_SELL_MIN_NET_PROFIT)):
+                            should_sell, reason = True, f"📊 RSI={rsi_15m} > {RSI_SELL} (net +{net_pnl_pct(pnl_pct)*100:.1f}%)"
                         else:
+                            # v23: daca RSI ar fi vandut dar pozitia e pe minus, logam -
+                            # asa vezi in loguri de cate ori te-a salvat noua regula.
+                            if (peak_pnl < TRAILING_TRIGGER and rsi_15m > RSI_SELL
+                                    and drop_from_peak >= RSI_SELL_MIN_DROP_FROM_PEAK):
+                                logger.info(f"🛡️ {symbol}: RSI={rsi_15m} ar fi vandut, dar PnL net "
+                                            f"{net_pnl_pct(pnl_pct)*100:+.2f}% < {RSI_SELL_MIN_NET_PROFIT*100:.1f}% "
+                                            f"— tin pozitia, las stop-loss-ul sa decida.")
                             opened_dt = datetime.fromisoformat(pos["opened_at"])
                             hours_held = (datetime.now() - opened_dt).total_seconds() / 3600
                             if hours_held >= MAX_HOLD_HOURS:
