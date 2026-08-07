@@ -90,8 +90,20 @@ FEE_RATE_PER_SIDE = 0.001
 # --- Stop Loss & Trailing ---
 TRAILING_TRIGGER = 0.025
 TRAILING_DISTANCE = 0.015
-BREAKEVEN_TRIGGER = 0.015
-BREAKEVEN_DISTANCE = 0.005
+BREAKEVEN_TRIGGER = 0.015   # activeaza stopul protejat dupa +1.5%
+
+# v25: "stop protejat" chiar protejeaza acum.
+# Inainte: BREAKEVEN_DISTANCE = 0.005, iar conditia era `pnl_pct <= -BREAKEVEN_DISTANCE`,
+# adica stopul se aseza la -0.5% SUB pretul de intrare. Rezultatul: o pozitie care
+# ti-a aratat deja +1.5% profit putea fi inchisa in PIERDERE. Exact asta s-a
+# intamplat cu ADA pe 07.08: varf +1.5% la 09:16, iesire -0.6% brut / -0.8% net.
+# Un stop numit "breakeven" care iese pe minus e o contradictie in termeni.
+# Acum: nivel POZITIV, exprimat direct ca pragul de PnL brut la care iesim.
+# 0.2% brut acopera exact comisioanele dus-intors (2 x 0.1%), deci iesirea e
+# aproximativ pe ZERO net, in loc de -0.8%.
+# ATENTIE: semnul e invers fata de vechea constanta - valoare POZITIVA inseamna
+# DEASUPRA pretului de intrare. De-asta am si redenumit-o, ca sa nu se confunde.
+BREAKEVEN_STOP_LEVEL = 0.002
 PARTIAL_PROFIT_TRIGGER = 0.025
 RSI_SELL_MIN_DROP_FROM_PEAK = 0.003
 
@@ -816,9 +828,11 @@ def run_bot():
 
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v24 (RSI corect Wilder + candele reparate) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v25 (stop protejat iese pe ZERO, nu pe minus) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"💾 Date salvate în: {DATA_DIR}{' ✅ persistent' if DATA_DIR != '.' else ' ⚠️ EFEMER - se pierde la redeploy!'}\n"
+                 f"🔧 v25: stop protejat iese la +{BREAKEVEN_STOP_LEVEL*100:.1f}% brut (≈ zero net), nu la -0.5%.\n"
+                 f"   Înainte: o poziție care atinsese +1.5% putea ieși în PIERDERE (ADA: -0.8% net).\n"
                  f"🔧 v24 — corecții de calcul:\n"
                  f"• RSI: formula Wilder (k=1/14), ca pe TradingView. Înainte era 2x prea reactiv\n"
                  f"   → valorile stau mai aproape de 50, deci semnale MAI RARE dar mai reale\n"
@@ -1070,8 +1084,9 @@ def run_bot():
 
                         if pnl_pct <= -stop_pct:
                             should_sell, reason = True, f"🛑 SL {pnl_pct*100:.1f}% (Stop: {stop_pct*100:.1f}%)"
-                        elif pos.get("breakeven_activated") and pnl_pct <= -BREAKEVEN_DISTANCE:
-                            should_sell, reason = True, f"🔒 Stop protejat (PnL: {pnl_pct*100:.1f}%)"
+                        # v25: iesim la +0.2% brut (≈ zero net), nu la -0.5%.
+                        elif pos.get("breakeven_activated") and pnl_pct <= BREAKEVEN_STOP_LEVEL:
+                            should_sell, reason = True, f"🔒 Stop protejat la +{BREAKEVEN_STOP_LEVEL*100:.1f}% (PnL: {pnl_pct*100:+.1f}%)"
                         elif peak_pnl >= TRAILING_TRIGGER and drop_from_peak >= TRAILING_DISTANCE:
                             should_sell, reason = True, f"📉 Trailing (Vârf: +{peak_pnl*100:.1f}%, Acum: +{pnl_pct*100:.1f}%)"
                         # v23: conditia noua - RSI vinde doar daca suntem efectiv pe
