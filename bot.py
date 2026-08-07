@@ -127,6 +127,15 @@ ATR_PERIOD = 14
 MIN_VOLUME_RATIO = 1.1   # coborat de la 1.2 - cu masuratoarea corecta, 1.2 e prea strict
 MAX_SPREAD_PCT = 0.003
 
+# v24: volum DIRECTIONAL, aplicat DOAR strategiei de momentum.
+# Problema pe care o rezolva: "volum mare" e ambiguu. O candela ROSIE cu volum
+# urias (vanzare agresiva / dump) trece testul volumului la fel de bine ca una
+# verde, desi semnaleaza exact opusul unei oportunitati de breakout.
+# De ce DOAR pe momentum: mean-reversion cumpara intentionat pe slabiciune -
+# scopul ei e sa prinda un dip. Sa-i ceri lumanare verde ar contrazice premisa
+# strategiei si ar bloca exact tranzactiile pe care e construita.
+MOMENTUM_REQUIRES_GREEN_CANDLE = True
+
 # --- Correlation ---
 # v21: relaxat de la 0.85 la 0.92 - altcoin-urile au corelatie de retururi
 # aproape mereu >0.85 intre ele, deci dupa prima pozitie deschisa toate
@@ -455,20 +464,47 @@ def reconcile_position_balance(symbol, coin, pos):
 
     return pos["quantity"]
 
+def normalize_candles(candles):
+    """
+    v24 NOU: sorteaza candelele CRONOLOGIC CRESCATOR dupa timestamp (campul [0]).
+
+    De ce: codul vechi presupunea implicit o anumita ordine si o "repara" cu
+    reversed() in fiecare functie separat - iar functiile NU erau de acord intre
+    ele. get_closes() facea reversed(candles), dar calculate_vwap() facea
+    candles[-20:] SI APOI reversed. Cu aceeasi lista de intrare, una lua cele
+    mai NOI 20 de candele, cealalta pe cele mai VECHI 20 (adica date de acum
+    ~37 de ore la interval de 15m). Cel putin una din ele era sigur gresita.
+    Solutia: normalizam o singura data, la sursa, dupa timestamp real. Asa
+    codul devine imun la ordinea in care API-ul returneaza datele, indiferent
+    daca Bitget schimba comportamentul in viitor. Dupa normalizare,
+    candles[-1] = cea mai RECENTA candela, peste tot, mereu.
+    """
+    if not candles:
+        return []
+    try:
+        return sorted(candles, key=lambda c: int(c[0]))
+    except (ValueError, TypeError, IndexError) as e:
+        logger.warning(f"Nu pot sorta candelele dupa timestamp ({e}), le las asa cum au venit.")
+        return candles
+
 def get_candles(symbol, granularity="15min", limit=150):
     path = f"/api/v2/spot/market/candles?symbol={symbol}&granularity={granularity}&limit={limit}"
     data = safe_request("GET", BASE_URL + path)
-    return data.get("data", []) if data and data.get("code") == "00000" else []
+    raw = data.get("data", []) if data and data.get("code") == "00000" else []
+    return normalize_candles(raw)
 
 def get_orderbook(symbol, limit=5):
     path = f"/api/v2/spot/market/orderbook?symbol={symbol}&limit={limit}"
     data = safe_request("GET", BASE_URL + path)
     return data.get("data", {}) if data and data.get("code") == "00000" else None
 
-def get_closes(candles): return [float(c[4]) for c in reversed(candles)]
-def get_volumes(candles): return [float(c[5]) for c in reversed(candles)]
-def get_highs(candles): return [float(c[2]) for c in reversed(candles)]
-def get_lows(candles): return [float(c[3]) for c in reversed(candles)]
+# v24: candelele vin deja sortate cronologic crescator din get_candles(),
+# deci NU mai facem reversed() aici. [-1] = cea mai recenta, [-2] = ultima inchisa.
+def get_closes(candles): return [float(c[4]) for c in candles]
+def get_volumes(candles): return [float(c[5]) for c in candles]
+def get_highs(candles): return [float(c[2]) for c in candles]
+def get_lows(candles): return [float(c[3]) for c in candles]
+def get_opens(candles): return [float(c[1]) for c in candles]
 
 def get_current_price(symbol):
     path = f"/api/v2/spot/market/tickers?symbol={symbol}"
@@ -489,13 +525,25 @@ def get_spread(symbol):
 
 # ---------------- INDICATORI ----------------
 def calculate_rsi_ema(closes, period=14):
+    """
+    v24 CORECTAT: RSI dupa formula originala a lui J. Welles Wilder.
+    Inainte foloseam netezire EMA clasica, k = 2/(period+1) = 0.133 pentru
+    period=14. Wilder foloseste k = 1/period = 0.071 - adica JUMATATE. Efectul:
+    RSI-ul nostru era de ~2x mai reactiv decat cel afisat de TradingView sau
+    Bitget, deci atingea 70 (si 30) mult mai usor si mai des decat "ar fi
+    trebuit". Asta explica de ce regula de vanzare pe RSI>70 se declansa atat
+    de devreme - indicatorul sarea peste prag la miscari mici de pret.
+    ATENTIE la interpretare: cu formula corecta, valorile RSI stau mai aproape
+    de 50, deci pragurile de cumparare (<45) si vanzare (>70) se ating MAI RAR.
+    E normal - inseamna semnale mai selective, nu ca botul s-a stricat.
+    """
     if len(closes) < period + 1: return 50.0
     deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
     gains = [max(d, 0) for d in deltas]
     losses = [abs(min(d, 0)) for d in deltas]
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
-    k = 2 / (period + 1)
+    k = 1 / period  # Wilder's smoothing (RMA), NU 2/(period+1)
     for i in range(period, len(gains)):
         avg_gain = gains[i] * k + avg_gain * (1 - k)
         avg_loss = losses[i] * k + avg_loss * (1 - k)
@@ -550,10 +598,20 @@ def calculate_adx(highs, lows, closes, period=14):
     for dx in dx_values[period:]: adx = (adx * (period - 1) + dx) / period
     return round(adx, 2)
 
-def calculate_vwap(candles):
+def calculate_vwap(candles, lookback=20):
+    """
+    v24 REPARAT: acum ia efectiv ultimele `lookback` candele (cele mai recente),
+    nu cele mai vechi - vezi explicatia din normalize_candles().
+
+    Nota de precizie: asta NU e VWAP-ul institutional (care se reseteaza zilnic
+    la 00:00 UTC), ci un VWMA - medie ponderata cu volumul pe 20 de perioade.
+    Pastram VWMA intentionat: e un reper mobil, util ca filtru de mean-reversion
+    la orice ora, pe cand VWAP-ul de sesiune e practic inutil in primele ore
+    dupa miezul noptii, cand are prea putine date in spate.
+    """
     if not candles: return None
     total_pv, total_v = 0, 0
-    for c in reversed(candles[-20:]):
+    for c in candles[-lookback:]:
         tp = (float(c[2]) + float(c[3]) + float(c[4])) / 3
         v = float(c[5])
         total_pv += tp * v
@@ -758,9 +816,14 @@ def run_bot():
 
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v23 (RSI nu mai vinde în pierdere) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v24 (RSI corect Wilder + candele reparate) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"💾 Date salvate în: {DATA_DIR}{' ✅ persistent' if DATA_DIR != '.' else ' ⚠️ EFEMER - se pierde la redeploy!'}\n"
+                 f"🔧 v24 — corecții de calcul:\n"
+                 f"• RSI: formula Wilder (k=1/14), ca pe TradingView. Înainte era 2x prea reactiv\n"
+                 f"   → valorile stau mai aproape de 50, deci semnale MAI RARE dar mai reale\n"
+                 f"• Candele sortate după timestamp — VWAP folosea date vechi de ~37h\n"
+                 f"• Momentum cere candelă verde (volum mare pe roșu = dump, nu breakout)\n"
                  f"🔧 v23: RSI>70 închide poziția DOAR dacă e pe profit net (min +{RSI_SELL_MIN_NET_PROFIT*100:.1f}%).\n"
                  f"   Înainte vindea și în pierdere — a cauzat 2 ieșiri pe minus (UNI -0.7%, ADA -0.2%).\n"
                  f"Restul (v21):\n"
@@ -846,6 +909,12 @@ def run_bot():
                         last_closed_volume, avg_volume = 0, 0
                     volume_ok = last_closed_volume > avg_volume * MIN_VOLUME_RATIO if avg_volume > 0 else False
 
+                    # v24: a fost ultima candela INCHISA verde (close > open)?
+                    # Folosit doar de momentum - vezi MOMENTUM_REQUIRES_GREEN_CANDLE.
+                    opens_15m = get_opens(candles_15m)
+                    last_candle_green = (len(opens_15m) >= 2 and len(closes_15m) >= 2
+                                         and closes_15m[-2] > opens_15m[-2])
+
                     spread = get_spread(symbol)
                     spread_ok = spread < MAX_SPREAD_PCT
 
@@ -886,7 +955,10 @@ def run_bot():
                                 breakout_ok = price > recent_high * (1 + MOMENTUM_BREAKOUT_MARGIN)
                                 momentum_rsi_ok = (RSI_MOMENTUM_MIN < rsi_15m < RSI_MOMENTUM_MAX
                                                     and RSI_MOMENTUM_1H_MIN < rsi_1h < RSI_MOMENTUM_1H_MAX)
-                                momentum_ok = breakout_ok and momentum_rsi_ok
+                                # v24: breakout-ul trebuie confirmat de o candela verde -
+                                # altfel "volum mare" poate insemna dump, nu cerere.
+                                green_ok = last_candle_green or not MOMENTUM_REQUIRES_GREEN_CANDLE
+                                momentum_ok = breakout_ok and momentum_rsi_ok and green_ok
 
                         entry_ok = mean_rev_ok or momentum_ok
                         entry_strategy = "momentum" if (momentum_ok and not mean_rev_ok) else "mean-reversion"
