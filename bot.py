@@ -126,7 +126,17 @@ RSI_SELL_MIN_NET_PROFIT = 0.002   # PnL net minim ca RSI sa aiba voie sa vanda (
 # --- Time & Position ---
 COOLDOWN_MINUTES = 45
 MAX_CONCURRENT_POSITIONS = 3
-MAX_HOLD_HOURS = 48
+
+# v26: MAX_HOLD_HOURS urcat de la 48h la 168h (7 zile).
+# Motiv: cu 48h, pozitiile care stagneaza (fara sa atinga stop-loss, breakeven
+# sau trailing) erau inchise fortat - inclusiv in weekend, cand piata e oricum
+# mai linistita si mai putin probabil sa se miste. Regula taia des exact in
+# pierdere mica, fara sa fi avut nicio sansa reala sa revina. Nu deranjeaza sa
+# stea capitalul blocat intr-o pozitie stagnanta - stop-loss/trailing/breakeven
+# raman active tot timpul si protejeaza oricum impotriva unei miscari mari.
+# 168h ramane totusi o plasa de siguranta pentru o moneda cu adevarat "moarta",
+# nu eliminata complet.
+MAX_HOLD_HOURS = 168
 
 # --- Volatilitate ---
 ATR_PERIOD = 14
@@ -828,9 +838,11 @@ def run_bot():
 
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v25 (stop protejat iese pe ZERO, nu pe minus) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v26 (time exit la 7 zile, nu 48h) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"💾 Date salvate în: {DATA_DIR}{' ✅ persistent' if DATA_DIR != '.' else ' ⚠️ EFEMER - se pierde la redeploy!'}\n"
+                 f"🔧 v26: Time exit la {MAX_HOLD_HOURS}h (7 zile), nu 48h — pozițiile stagnante nu mai sunt\n"
+                 f"   tăiate forțat în weekend, când piața oricum se mișcă mai puțin.\n"
                  f"🔧 v25: stop protejat iese la +{BREAKEVEN_STOP_LEVEL*100:.1f}% brut (≈ zero net), nu la -0.5%.\n"
                  f"   Înainte: o poziție care atinsese +1.5% putea ieși în PIERDERE (ADA: -0.8% net).\n"
                  f"🔧 v24 — corecții de calcul:\n"
