@@ -75,7 +75,7 @@ EMA_PERIOD_MACRO = 30  # pe 4h
 
 # --- Risk Management ---
 RISK_PER_TRADE = 0.02
-MAX_ALLOCATION_PER_TRADE = 0.25
+MAX_ALLOCATION_PER_TRADE = 0.35
 MIN_TRADE_USDT = 5
 
 # v21: in regim RANGE nu mai blocam complet cumpararea (vezi REQUIRE_TREND_REGIME),
@@ -83,7 +83,7 @@ MIN_TRADE_USDT = 5
 # pierdere mai mare in RANGE, deci intram, dar cu risc injumatatit.
 RANGE_SIZE_MULTIPLIER = 0.5
 
-MAX_TOTAL_EXPOSURE_PCT = 0.60
+MAX_TOTAL_EXPOSURE_PCT = 0.75
 MAX_DAILY_DRAWDOWN_PCT = 0.05
 FEE_RATE_PER_SIDE = 0.001
 
@@ -704,12 +704,27 @@ def check_correlation_filter(symbol):
             return False
     return True
 
-def log_trade_closed(symbol, entry, exit_price, qty, hours, reason, regime):
+def log_trade_closed(symbol, entry, exit_price, qty, hours, reason, regime,
+                      entry_strategy="?", rsi_at_entry=None, adx_at_entry=None, volume_ratio_at_entry=None):
+    """
+    v27.1: extins cu campurile de la INTRARE (entry_strategy, RSI, ADX, volum),
+    nu doar cele de la iesire. Fara astea, trades.csv nu poate raspunde la
+    intrebari de genul "tranzactiile momentum cu ADX>30 merg mai bine decat
+    cele mean-reversion cu ADX<25?" - exact analiza pe care backtesting-ul
+    trebuie sa o faca. Campurile vechi raman neschimbate, doar adaugam la coada.
+    """
     pnl_usd = (exit_price - entry) * qty
     pnl_pct = (exit_price - entry) / entry
     try:
         with open(TRADES_CSV, "a", newline="") as f:
-            csv.writer(f).writerow([datetime.now().isoformat(), symbol, entry, exit_price, qty, round(pnl_usd,4), round(pnl_pct*100,2), round(hours,2), reason, regime])
+            csv.writer(f).writerow([
+                datetime.now().isoformat(), symbol, entry, exit_price, qty,
+                round(pnl_usd,4), round(pnl_pct*100,2), round(hours,2), reason, regime,
+                entry_strategy,
+                rsi_at_entry if rsi_at_entry is not None else "",
+                adx_at_entry if adx_at_entry is not None else "",
+                round(volume_ratio_at_entry,2) if volume_ratio_at_entry is not None else ""
+            ])
     except Exception as e: logger.error(f"CSV log error: {e}")
 
 # ---------------- DRAWDOWN ZILNIC & PnL NET ----------------
@@ -838,9 +853,13 @@ def run_bot():
 
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v26 (time exit la 7 zile, nu 48h) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v27.1 (logging extins) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"💾 Date salvate în: {DATA_DIR}{' ✅ persistent' if DATA_DIR != '.' else ' ⚠️ EFEMER - se pierde la redeploy!'}\n"
+                 f"🔧 v27.1: trades.csv acum salvează și RSI/ADX/volum de la INTRARE, nu doar\n"
+                 f"   la ieșire — pregătire pentru backtesting (ca să vedem ce combinații chiar merg).\n"
+                 f"🔧 v27: Alocare max per tranzactie 25%→{MAX_ALLOCATION_PER_TRADE*100:.0f}%, expunere totala max 60%→{MAX_TOTAL_EXPOSURE_PCT*100:.0f}%.\n"
+                 f"   Pozitii mai mari per moneda (ex. ~$6-9 → ~$10-15), risc procentual per tranzactie neschimbat.\n"
                  f"🔧 v26: Time exit la {MAX_HOLD_HOURS}h (7 zile), nu 48h — pozițiile stagnante nu mai sunt\n"
                  f"   tăiate forțat în weekend, când piața oricum se mișcă mai puțin.\n"
                  f"🔧 v25: stop protejat iese la +{BREAKEVEN_STOP_LEVEL*100:.1f}% brut (≈ zero net), nu la -0.5%.\n"
@@ -859,7 +878,7 @@ def run_bot():
                  f"• Corelație: prag urcat la {MAX_CORRELATION} (permite mai multe poziții)\n"
                  f"• Fear&Greed + piață generală: dezactivate (blocau rar, cod mort)\n"
                  f"Comenzi: /pause /resume /status /stats /resetstats\n"
-                 f"Risc 2%, Expunere max {MAX_TOTAL_EXPOSURE_PCT*100:.0f}%, Daily DD max {MAX_DAILY_DRAWDOWN_PCT*100:.0f}%\n"
+                 f"Risc 2%, Alocare max/tranzactie {MAX_ALLOCATION_PER_TRADE*100:.0f}%, Expunere max {MAX_TOTAL_EXPOSURE_PCT*100:.0f}%, Daily DD max {MAX_DAILY_DRAWDOWN_PCT*100:.0f}%\n"
                  f"Monitorizez: {', '.join(SYMBOLS)}")
     logger.info(start_msg)
     send_telegram(start_msg)
@@ -1045,12 +1064,16 @@ def run_bot():
                                         if real_qty <= 0:
                                             real_qty = (trade_amount * 0.999) / price
 
+                                    volume_ratio_entry = (last_closed_volume / avg_volume) if avg_volume else None
                                     positions[symbol] = {
                                         "price": price, "quantity": real_qty, "peak": price,
                                         "opened_at": datetime.now().isoformat(),
                                         "breakeven_activated": False, "partial_sold": False,
                                         "stop_pct": stop_pct, "entry_strategy": entry_strategy,
-                                        "regime": regime
+                                        "regime": regime,
+                                        # v27.1: pastram contextul de la intrare pentru backtesting/analiza
+                                        "rsi_at_entry": rsi_15m, "adx_at_entry": adx,
+                                        "volume_ratio_at_entry": volume_ratio_entry
                                     }
                                     save_state()
                                     strat_emoji = "🚀" if entry_strategy == "momentum" else "🔻"
@@ -1141,7 +1164,11 @@ def run_bot():
                                            f"📅 PnL azi: {daily_realized_pnl:+.2f} USDT\n"
                                            f"{'🧪 SIM' if DRY_RUN else '💰 REAL'}")
                                     logger.info(msg); send_telegram(msg)
-                                    log_trade_closed(symbol, entry, price, sell_qty, hours_held, reason, pos.get("regime", "?"))
+                                    log_trade_closed(symbol, entry, price, sell_qty, hours_held, reason, pos.get("regime", "?"),
+                                                      entry_strategy=pos.get("entry_strategy", "?"),
+                                                      rsi_at_entry=pos.get("rsi_at_entry"),
+                                                      adx_at_entry=pos.get("adx_at_entry"),
+                                                      volume_ratio_at_entry=pos.get("volume_ratio_at_entry"))
                                     last_sell_time[symbol] = time.time()
                                     del positions[symbol]
                                     save_state()
