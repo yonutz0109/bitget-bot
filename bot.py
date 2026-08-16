@@ -11,10 +11,16 @@ import signal
 import sys
 import logging
 import csv
+import threading
+import http.server
+import socketserver
 from datetime import datetime
 from collections import deque
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from logging.handlers import RotatingFileHandler
+
+__version__ = "29.0"
 
 # ---------------- CONFIG ----------------
 API_KEY = os.environ.get("BITGET_API_KEY", "")
@@ -29,16 +35,15 @@ BASE_URL = "https://api.bitget.com"
 # v22: fisierele de stare se scriu intr-un director configurabil prin variabila
 # de mediu DATA_DIR. Pe Northflank atasam un volum persistent montat la /data
 # si setam DATA_DIR=/data - altfel, la fiecare redeploy filesystem-ul se
-# reseteaza, bot_state.json dispare, iar pozitiile deschise raman "orfane":
-# botul uita de ele (fara stop-loss, fara trailing) si poate chiar recumpara
-# aceeasi moneda crezand ca nu are pozitie. Exact asta s-a intamplat cu UNI.
-# Daca DATA_DIR nu e setat, se foloseste directorul curent (comportament vechi).
+# reseteaza, bot_state.json dispare, iar pozitiile deschise raman "orfane".
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 try:
     os.makedirs(DATA_DIR, exist_ok=True)
 except Exception as _e:
     print(f"ATENTIE: nu pot crea {DATA_DIR} ({_e}), folosesc directorul curent.")
     DATA_DIR = "."
+
+HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 
 STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
 LOG_FILE = os.path.join(DATA_DIR, "bot.log")
@@ -56,11 +61,6 @@ RSI_MAX_1H = 60
 RSI_SELL = 70
 
 # --- Strategie Momentum ---
-# v21: fereastra RSI largita. Inainte ceream rsi_15m intre 52 si 62 - la un
-# breakout REAL, RSI-ul pe 15m sare frecvent peste 62 in cateva minute, deci
-# prindeam doar breakout-uri firave, exact opusul a ce vrem de la momentum.
-# Acum: 50-72 pe 15m (sub RSI_SELL=70 nu mai e o cerinta - un breakout puternic
-# POATE fi supracumparat pe termen scurt), iar pe 1h largim la 35-68.
 MOMENTUM_ENABLED = True
 RSI_MOMENTUM_MIN = 50
 RSI_MOMENTUM_MAX = 72
@@ -77,12 +77,7 @@ EMA_PERIOD_MACRO = 30  # pe 4h
 RISK_PER_TRADE = 0.02
 MAX_ALLOCATION_PER_TRADE = 0.35
 MIN_TRADE_USDT = 5
-
-# v21: in regim RANGE nu mai blocam complet cumpararea (vezi REQUIRE_TREND_REGIME),
-# dar reducem dimensiunea pozitiei - datele din trades.csv au aratat rata de
-# pierdere mai mare in RANGE, deci intram, dar cu risc injumatatit.
 RANGE_SIZE_MULTIPLIER = 0.5
-
 MAX_TOTAL_EXPOSURE_PCT = 0.75
 MAX_DAILY_DRAWDOWN_PCT = 0.05
 FEE_RATE_PER_SIDE = 0.001
@@ -90,88 +85,31 @@ FEE_RATE_PER_SIDE = 0.001
 # --- Stop Loss & Trailing ---
 TRAILING_TRIGGER = 0.025
 TRAILING_DISTANCE = 0.015
-BREAKEVEN_TRIGGER = 0.015   # activeaza stopul protejat dupa +1.5%
-
-# v25: "stop protejat" chiar protejeaza acum.
-# Inainte: BREAKEVEN_DISTANCE = 0.005, iar conditia era `pnl_pct <= -BREAKEVEN_DISTANCE`,
-# adica stopul se aseza la -0.5% SUB pretul de intrare. Rezultatul: o pozitie care
-# ti-a aratat deja +1.5% profit putea fi inchisa in PIERDERE. Exact asta s-a
-# intamplat cu ADA pe 07.08: varf +1.5% la 09:16, iesire -0.6% brut / -0.8% net.
-# Un stop numit "breakeven" care iese pe minus e o contradictie in termeni.
-# Acum: nivel POZITIV, exprimat direct ca pragul de PnL brut la care iesim.
-# 0.2% brut acopera exact comisioanele dus-intors (2 x 0.1%), deci iesirea e
-# aproximativ pe ZERO net, in loc de -0.8%.
-# ATENTIE: semnul e invers fata de vechea constanta - valoare POZITIVA inseamna
-# DEASUPRA pretului de intrare. De-asta am si redenumit-o, ca sa nu se confunde.
+BREAKEVEN_TRIGGER = 0.015
 BREAKEVEN_STOP_LEVEL = 0.002
 PARTIAL_PROFIT_TRIGGER = 0.025
 RSI_SELL_MIN_DROP_FROM_PEAK = 0.003
-
-# v23: BUG DE LOGICA REPARAT. Regula "RSI > 70 -> vinde" nu verifica deloc daca
-# pozitia e pe profit. Ce se intampla in practica (confirmat de trades.csv):
-# botul cumpara cu RSI jos (36-44), pretul urca putin - destul cat RSI sa sara
-# peste 70, dar NU destul cat sa acopere pretul de intrare + comisioane. Apoi la
-# o scadere de doar 0.3% de la varf, regula RSI inchide pozitia... in pierdere.
-#   UNI:  intrare 4.059  -> iesire 4.031  = -0.69%  (motiv: RSI 72.41 > 70)
-#   ADA:  intrare 0.189  -> iesire 0.1886 = -0.21%  (motiv: RSI 70.64 > 70)
-# Ambele inchise de RSI, ambele pe minus. Nu e ghinion, e o regula care vinde
-# "pentru ca e supracumparat" chiar cand TU esti sub pretul de intrare - moment
-# in care nu exista niciun profit de protejat.
-# Fix: RSI poate inchide pozitia DOAR daca PnL-ul NET (dupa comisioane dus-intors)
-# e pozitiv. Sub acel prag, lasam stop-loss-ul sa decida - el exista exact pentru
-# cazul in care lucrurile merg prost.
 RSI_SELL_REQUIRES_PROFIT = True
-RSI_SELL_MIN_NET_PROFIT = 0.002   # PnL net minim ca RSI sa aiba voie sa vanda (0.2%)
+RSI_SELL_MIN_NET_PROFIT = 0.002
 
 # --- Time & Position ---
 COOLDOWN_MINUTES = 45
 MAX_CONCURRENT_POSITIONS = 3
-
-# v26: MAX_HOLD_HOURS urcat de la 48h la 168h (7 zile).
-# Motiv: cu 48h, pozitiile care stagneaza (fara sa atinga stop-loss, breakeven
-# sau trailing) erau inchise fortat - inclusiv in weekend, cand piata e oricum
-# mai linistita si mai putin probabil sa se miste. Regula taia des exact in
-# pierdere mica, fara sa fi avut nicio sansa reala sa revina. Nu deranjeaza sa
-# stea capitalul blocat intr-o pozitie stagnanta - stop-loss/trailing/breakeven
-# raman active tot timpul si protejeaza oricum impotriva unei miscari mari.
-# 168h ramane totusi o plasa de siguranta pentru o moneda cu adevarat "moarta",
-# nu eliminata complet.
 MAX_HOLD_HOURS = 168
 
 # --- Volatilitate ---
 ATR_PERIOD = 14
 
 # --- Volum & Spread ---
-# v21: BUG REPARAT — inainte comparam volumes_15m[-1], adica candela CURENTA,
-# INCOMPLETA. In primele minute ale unei candele de 15m volumul e natural mic,
-# deci filtrul pica aproape mereu, indiferent de piata. Acum folosim ultima
-# candela INCHISA ([-2]) si comparam cu media candelelor inchise anterioare.
-MIN_VOLUME_RATIO = 1.1   # coborat de la 1.2 - cu masuratoarea corecta, 1.2 e prea strict
+MIN_VOLUME_RATIO = 1.1
 MAX_SPREAD_PCT = 0.003
-
-# v24: volum DIRECTIONAL, aplicat DOAR strategiei de momentum.
-# Problema pe care o rezolva: "volum mare" e ambiguu. O candela ROSIE cu volum
-# urias (vanzare agresiva / dump) trece testul volumului la fel de bine ca una
-# verde, desi semnaleaza exact opusul unei oportunitati de breakout.
-# De ce DOAR pe momentum: mean-reversion cumpara intentionat pe slabiciune -
-# scopul ei e sa prinda un dip. Sa-i ceri lumanare verde ar contrazice premisa
-# strategiei si ar bloca exact tranzactiile pe care e construita.
 MOMENTUM_REQUIRES_GREEN_CANDLE = True
 
 # --- Correlation ---
-# v21: relaxat de la 0.85 la 0.92 - altcoin-urile au corelatie de retururi
-# aproape mereu >0.85 intre ele, deci dupa prima pozitie deschisa toate
-# celelalte erau blocate automat. MAX_CONCURRENT_POSITIONS=3 era teoretic:
-# practic aveam mereu 1 singura pozitie. 0.92 blocheaza doar perechile
-# aproape identice (ex. BTC/ETH in zile foarte corelate).
 CORRELATION_WINDOW = 50
 MAX_CORRELATION = 0.92
 
 # --- Market Regime ---
-# v21: ADX prag coborat de la 25 la 20, SI regimul TREND nu mai e obligatoriu.
-# Inainte "regime == TREND" era o conditie AND absoluta, rar indeplinita.
-# Acum: in RANGE cumparam doar pe mean-reversion (nu momentum - un breakout
-# fara trend e de obicei fals) si cu pozitie redusa la RANGE_SIZE_MULTIPLIER.
 ADX_PERIOD = 14
 ADX_TREND_THRESHOLD = 20
 REQUIRE_TREND_REGIME = False
@@ -184,17 +122,11 @@ BTC_DROP_LOOKBACK_H = 4
 BTC_EMA_TOLERANCE = 0.99
 
 # --- Fear & Greed Index ---
-# v21: DEZACTIVAT. Pragul de 15 ("frica extrema") se atinge extrem de rar -
-# practic era cod mort care adauga un apel API pe ciclu fara sa blocheze
-# vreodata ceva. Filtrul BTC acopera deja aceeasi nevoie, mai reactiv.
-# Se poate reactiva oricand punand True.
 FEAR_GREED_ENABLED = False
 FEAR_GREED_EXTREME_THRESHOLD = 15
 FEAR_GREED_CACHE_MINUTES = 30
 
 # --- Filtru piata generala crypto ---
-# v21: DEZACTIVAT, acelasi motiv - o scadere de peste 3% a capitalizarii
-# totale in 24h e rara, iar cand se intampla filtrul BTC deja a blocat.
 MARKET_TREND_ENABLED = False
 MARKET_DROP_THRESHOLD = 0.03
 MARKET_TREND_CACHE_MINUTES = 15
@@ -202,15 +134,42 @@ MARKET_TREND_CACHE_MINUTES = 15
 REQUEST_TIMEOUT = 10
 LOOP_INTERVAL = 120
 
+# ═══════════════════════════════════════════════════════════════
+# FUTURES SHORT — v29 NOU, LIVE
+# ═══════════════════════════════════════════════════════════════
+# Config RSI 55-78: singura varianta testata prin backtest (short_only.py,
+# BTC/ETH/SOL, walk-forward pe 6 ferestre). Rezultat: -3.0% full-period,
+# 55.5% win rate, negativ pe 5/6 ferestre OOS — NU are edge statistic
+# dovedit, doar risc administrat similar cu long-ul. Activat live la cererea
+# explicita a userului, cu constientizarea acestui rezultat.
+FUTURES_ENABLED = True
+FUTURES_LEVERAGE = 2
+FUTURES_MARGIN_MODE = "isolated"
+FUTURES_PRODUCT_TYPE = "USDT-FUTURES"
+FUTURES_MARGIN_COIN = "USDT"
+FUTURES_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+MAX_FUTURES_POSITIONS = 2
+MAX_FUTURES_EXPOSURE_PCT = 0.30
+MIN_FUTURES_TRADE_USDT = 10
+
+SHORT_RSI_MIN = 55
+SHORT_RSI_MAX = 78
+SHORT_BREAKOUT_LOOKBACK = 10
+SHORT_BREAKOUT_MARGIN = 0.001
+SHORT_REQUIRES_RED_CANDLE = True
+
 if not DRY_RUN and not (API_KEY and SECRET_KEY and PASSPHRASE):
     print("EROARE: lipsesc credențialele Bitget și DRY_RUN=false. Opresc botul.")
     sys.exit(1)
 
-# ---------------- LOGGING ----------------
+# ---------------- LOGGING (v29: rotating, nu creste la nesfarsit) ----------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)]
+    handlers=[
+        RotatingFileHandler(LOG_FILE, maxBytes=10_485_760, backupCount=3),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
 logger = logging.getLogger("bot")
 
@@ -218,16 +177,87 @@ def log_json(event_type, data):
     entry = {"timestamp": datetime.now().isoformat(), "event": event_type, "data": data}
     logger.info(json.dumps(entry))
 
+# ═══════════════════════════════════════════════════════════════
+# v29 NOU: RATE LIMITER (token bucket, 8 req/s conservator fata de limita
+# Bitget de 10 req/s) — protejeaza impotriva HTTP 429 cand short-ul futures
+# adauga apeluri API in plus fata de spot.
+# ═══════════════════════════════════════════════════════════════
+class RateLimiter:
+    def __init__(self, rate=8.0, per=1.0):
+        self._rate = rate
+        self._per = per
+        self._allowance = rate
+        self._last_check = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self, tokens=1.0):
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_check
+            self._last_check = now
+            self._allowance += elapsed * (self._rate / self._per)
+            if self._allowance > self._rate:
+                self._allowance = self._rate
+            if self._allowance < tokens:
+                sleep_needed = (tokens - self._allowance) / (self._rate / self._per)
+                time.sleep(sleep_needed)
+                self._allowance = 0.0
+                self._last_check = time.monotonic()
+            else:
+                self._allowance -= tokens
+
+rate_limiter = RateLimiter(rate=8.0, per=1.0)
+
 # ---------------- HTTP SESSION ----------------
 session = requests.Session()
 retry_cfg = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retry_cfg))
+
+# ═══════════════════════════════════════════════════════════════
+# v29 NOU: CIRCUIT BREAKER — daca API-ul Bitget da erori consecutive (ex.
+# probleme de retea, mentenanta), oprim temporar cererile in loc sa
+# bombardam API-ul si sa riscam ban temporar de IP.
+# ═══════════════════════════════════════════════════════════════
+class CircuitBreaker:
+    def __init__(self, threshold=5, cooldown_seconds=60.0):
+        self.threshold = threshold
+        self.cooldown = cooldown_seconds
+        self._failures = 0
+        self._tripped_until = None
+        self._lock = threading.Lock()
+
+    def record_success(self):
+        with self._lock:
+            self._failures = 0
+            self._tripped_until = None
+
+    def record_failure(self):
+        with self._lock:
+            self._failures += 1
+            if self._failures >= self.threshold:
+                self._tripped_until = time.monotonic() + self.cooldown
+                logger.warning(f"Circuit breaker DECLANSAT pentru {self.cooldown}s")
+                return True
+            return False
+
+    def is_open(self):
+        with self._lock:
+            if self._tripped_until is None:
+                return False
+            if time.monotonic() >= self._tripped_until:
+                self._tripped_until = None
+                self._failures = 0
+                return False
+            return True
+
+circuit_breaker = CircuitBreaker(threshold=5, cooldown_seconds=60.0)
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for attempt in range(1, 4):
         try:
+            rate_limiter.acquire()
             r = session.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=REQUEST_TIMEOUT)
             if r.status_code == 200:
                 return
@@ -239,43 +269,30 @@ def send_telegram(msg):
     logger.error(f"❌ Mesaj Telegram PIERDUT definitiv dupa 3 incercari: {msg[:100]}")
 
 def format_block_stats():
-    """
-    v21 NOU: raport agregat cu motivele pentru care botul NU a cumparat.
-    Asta e informatia cea mai valoroasa pentru reglaje viitoare: in loc sa
-    ghicim ce filtru e prea strict, vedem numeric care blocheaza cel mai des.
-    """
     if not block_stats:
         return "📊 Încă niciun blocaj înregistrat (sau botul tocmai a pornit)."
-
     total = sum(block_stats.values())
     lines = [f"📊 Motive pentru care NU am cumpărat"]
     if block_stats_since:
         lines.append(f"(de la {block_stats_since})")
     lines.append(f"Total verificări blocate: {total}\n")
-
     for reason, count in sorted(block_stats.items(), key=lambda x: -x[1]):
         pct = 100 * count / total if total else 0
         lines.append(f"{reason}: {count} ({pct:.0f}%)")
-
     lines.append("\n💡 Filtrul din capul listei e cel mai bun candidat de relaxat.")
     return "\n".join(lines)
 
 def check_telegram_commands():
-    """
-    Verifica o data pe ciclu daca a venit o comanda noua pe Telegram.
-    Comenzi: /pause /resume /status /stats /resetstats
-    """
     global bot_paused, telegram_last_update_id, block_stats, block_stats_since
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
-
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
         params = {"offset": telegram_last_update_id + 1, "timeout": 0, "limit": 20}
+        rate_limiter.acquire()
         r = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
             return
-
         results = r.json().get("result", [])
         for update in results:
             telegram_last_update_id = max(telegram_last_update_id, update.get("update_id", 0))
@@ -283,21 +300,17 @@ def check_telegram_commands():
             chat_id = str(msg.get("chat", {}).get("id", ""))
             text = msg.get("text", "").strip().lower()
             msg_date = msg.get("date", 0)
-
             if chat_id != str(TELEGRAM_CHAT_ID):
                 continue
-
             if msg_date and msg_date < bot_start_time - 5:
                 continue
-
             if text in ("/pause", "pauza", "/pauza"):
                 if not bot_paused:
                     bot_paused = True
                     logger.info("⏸️ Bot PAUZAT manual prin Telegram.")
-                    send_telegram("⏸️ Bot pauzat. Nu mai deschid poziții noi.\nPozițiile existente rămân gestionate normal (stop-loss/trailing active).\nScrie /resume ca să reiau.")
+                    send_telegram("⏸️ Bot pauzat. Nu mai deschid poziții noi (long sau short).\nPozițiile existente rămân gestionate normal.\nScrie /resume ca să reiau.")
                 else:
                     send_telegram("⏸️ Botul e deja pauzat.")
-
             elif text in ("/resume", "reia", "/reia", "/start_bot"):
                 if bot_paused:
                     bot_paused = False
@@ -305,25 +318,22 @@ def check_telegram_commands():
                     send_telegram("▶️ Bot repornit. Reiau căutarea de oportunități noi.")
                 else:
                     send_telegram("▶️ Botul rulează deja normal.")
-
             elif text in ("/status",):
                 mode_txt = "⏸️ PAUZAT" if bot_paused else "▶️ ACTIV"
                 pos_txt = ", ".join(positions.keys()) if positions else "niciuna"
-                send_telegram(f"{mode_txt}\nPoziții deschise: {len(positions)}/{MAX_CONCURRENT_POSITIONS} ({pos_txt})\nPnL azi: {daily_realized_pnl:+.2f} USDT")
-
-            # v21 NOU: raportul de blocaje, ca sa stim ce filtru sa relaxam
+                fut_txt = ", ".join(futures_positions.keys()) if futures_positions else "niciuna"
+                send_telegram(f"{mode_txt}\nLong (Spot): {len(positions)}/{MAX_CONCURRENT_POSITIONS} ({pos_txt})\n"
+                              f"Short (Futures): {len(futures_positions)}/{MAX_FUTURES_POSITIONS} ({fut_txt})\n"
+                              f"PnL azi: {daily_realized_pnl:+.2f} USDT")
             elif text in ("/stats", "/statistici"):
                 send_telegram(format_block_stats())
-
             elif text in ("/resetstats",):
                 block_stats = {}
                 block_stats_since = datetime.now().strftime("%d.%m %H:%M")
                 save_state()
                 send_telegram("🔄 Statisticile de blocaje au fost resetate.")
-
         if results:
             save_state()
-
     except Exception as e:
         logger.warning(f"Telegram getUpdates eroare (ignor, reincerc urmatorul ciclu): {e}")
 
@@ -344,7 +354,12 @@ def get_headers(method, path, body=""):
     }
 
 def safe_request(method, url, headers=None, data=None, params=None):
+    # v29: rate limiting + circuit breaker in jurul cererii existente
+    if circuit_breaker.is_open():
+        logger.warning("Circuit breaker DESCHIS — sar peste cerere")
+        return None
     try:
+        rate_limiter.acquire()
         r = session.request(method, url, headers=headers, data=data, params=params, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
             try:
@@ -352,17 +367,24 @@ def safe_request(method, url, headers=None, data=None, params=None):
                 bitget_msg = body.get("msg", "")
                 bitget_code = body.get("code", "")
                 logger.error(f"HTTP {r.status_code} la {url} — Bitget code={bitget_code}, msg={bitget_msg}")
+                if r.status_code >= 500 or r.status_code == 429:
+                    circuit_breaker.record_failure()
                 return body
             except ValueError:
                 logger.error(f"HTTP {r.status_code} la {url}: {r.text[:300]}")
+                if r.status_code >= 500 or r.status_code == 429:
+                    circuit_breaker.record_failure()
                 return None
+        circuit_breaker.record_success()
         return r.json()
     except Exception as e:
         logger.error(f"Eroare rețea la {url}: {e}")
+        circuit_breaker.record_failure()
         return None
 
 # ---------------- HEARTBEAT & STATE ----------------
 positions = {}
+futures_positions = {}   # v29 NOU: pozitii short pe futures
 last_sell_time = {}
 price_history = {}
 virtual_balance = None
@@ -371,21 +393,58 @@ daily_pnl_date = None
 bot_paused = False
 telegram_last_update_id = 0
 bot_start_time = 0.0
-block_stats = {}          # v21 NOU: contor {motiv: de_cate_ori_a_blocat}
-block_stats_since = None  # v21 NOU: de cand se aduna statisticile
+block_stats = {}
+block_stats_since = None
+_futures_leverage_set = set()  # v29: nu mai setam leverage-ul la fiecare ciclu
 
 def update_heartbeat(status="ok", extra=None):
     try:
-        hb = {"timestamp": datetime.now().isoformat(), "status": status, "positions_count": len(positions), "extra": extra or {}}
+        hb = {"timestamp": datetime.now().isoformat(), "status": status,
+              "positions_count": len(positions), "futures_count": len(futures_positions),
+              "dry_run": DRY_RUN, "version": __version__, "extra": extra or {}}
         with open(HEARTBEAT_FILE, "w") as f: json.dump(hb, f)
     except Exception as e: logger.error(f"Heartbeat error: {e}")
 
+# v29 NOU: server HTTP minimal pentru health-check-urile Northflank
+class HealthHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            if os.path.exists(HEARTBEAT_FILE):
+                with open(HEARTBEAT_FILE, "r") as f:
+                    hb = json.load(f)
+                status = hb.get("status", "ok")
+                code = 200 if status == "ok" else 503
+            else:
+                code, hb = 503, {"status": "no heartbeat"}
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(hb).encode())
+        except Exception:
+            self.send_response(500)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+def start_health_server(port=HEALTH_PORT):
+    def _serve():
+        with socketserver.TCPServer(("", port), HealthHandler) as httpd:
+            httpd.serve_forever()
+    t = threading.Thread(target=_serve, daemon=True, name="health-server")
+    t.start()
+    logger.info(f"Health server ascultă pe portul {port}")
+    return t
+
 def load_state():
-    global positions, last_sell_time, price_history, virtual_balance, daily_realized_pnl, daily_pnl_date, bot_paused, telegram_last_update_id, block_stats, block_stats_since
+    global positions, futures_positions, last_sell_time, price_history, virtual_balance
+    global daily_realized_pnl, daily_pnl_date, bot_paused, telegram_last_update_id
+    global block_stats, block_stats_since, _futures_leverage_set
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f: saved = json.load(f)
             positions = saved.get("positions", {})
+            futures_positions = saved.get("futures_positions", {})
             last_sell_time = saved.get("last_sell_time", {})
             virtual_balance = saved.get("virtual_balance", None)
             daily_realized_pnl = saved.get("daily_realized_pnl", 0.0)
@@ -394,9 +453,11 @@ def load_state():
             telegram_last_update_id = saved.get("telegram_last_update_id", 0)
             block_stats = saved.get("block_stats", {})
             block_stats_since = saved.get("block_stats_since", None)
+            _futures_leverage_set = set(saved.get("_futures_leverage_set", []))
             ph_raw = saved.get("price_history", {})
             price_history = {k: deque(v, maxlen=CORRELATION_WINDOW*2) for k, v in ph_raw.items()}
-            logger.info(f"Stare încărcată: {len(positions)} poziții" + (" | ⏸️ PAUZAT" if bot_paused else ""))
+            logger.info(f"Stare încărcată: {len(positions)} long + {len(futures_positions)} short"
+                        + (" | ⏸️ PAUZAT" if bot_paused else ""))
         except Exception as e:
             logger.error(f"Nu am putut încărca starea: {e}")
             positions, last_sell_time, price_history = {}, {}, {}
@@ -406,6 +467,7 @@ def save_state():
     try:
         state = {
             "positions": positions,
+            "futures_positions": futures_positions,
             "last_sell_time": last_sell_time,
             "virtual_balance": virtual_balance,
             "daily_realized_pnl": daily_realized_pnl,
@@ -414,7 +476,8 @@ def save_state():
             "telegram_last_update_id": telegram_last_update_id,
             "block_stats": block_stats,
             "block_stats_since": block_stats_since,
-            "price_history": {k: list(v) for k, v in price_history.items()}
+            "price_history": {k: list(v) for k, v in price_history.items()},
+            "_futures_leverage_set": list(_futures_leverage_set)
         }
         with open(tmp, "w") as f: json.dump(state, f, indent=2)
         os.replace(tmp, STATE_FILE)
@@ -446,7 +509,6 @@ def floor_qty(symbol, qty):
 def get_spot_balance(coin="USDT"):
     if DRY_RUN and coin == "USDT":
         return virtual_balance if virtual_balance is not None else 0.0
-
     path = "/api/v2/spot/account/assets"
     full_path = path + f"?coin={coin}"
     headers = get_headers("GET", full_path)
@@ -457,14 +519,8 @@ def get_spot_balance(coin="USDT"):
     return 0.0
 
 def reconcile_position_balance(symbol, coin, pos):
-    """
-    v20: cand un SELL esueaza cu balanta insuficienta, verificam balanta REALA
-    de pe Bitget si corectam sau stergem pozitia - altfel botul reincerca
-    orbeste aceeasi cantitate gresita la fiecare ciclu, la infinit.
-    """
     real_balance = get_spot_balance(coin)
     tracked_qty = pos["quantity"]
-
     if real_balance <= 0:
         logger.warning(f"⚠️ {symbol}: balanta reala {coin}=0, dar pozitia interna avea qty={tracked_qty}. Sterg pozitia (desincronizata).")
         send_telegram(
@@ -473,7 +529,6 @@ def reconcile_position_balance(symbol, coin, pos):
             f"(fără să înregistrez PnL - verifică manual istoricul de tranzacții pe Bitget)."
         )
         return None
-
     diff_ratio = abs(real_balance - tracked_qty) / max(tracked_qty, 1e-9)
     if diff_ratio > 0.01:
         logger.warning(f"⚠️ {symbol}: qty interna {tracked_qty} != balanta reala {real_balance}. Corectez.")
@@ -483,24 +538,9 @@ def reconcile_position_balance(symbol, coin, pos):
         )
         pos["quantity"] = real_balance
         save_state()
-
     return pos["quantity"]
 
 def normalize_candles(candles):
-    """
-    v24 NOU: sorteaza candelele CRONOLOGIC CRESCATOR dupa timestamp (campul [0]).
-
-    De ce: codul vechi presupunea implicit o anumita ordine si o "repara" cu
-    reversed() in fiecare functie separat - iar functiile NU erau de acord intre
-    ele. get_closes() facea reversed(candles), dar calculate_vwap() facea
-    candles[-20:] SI APOI reversed. Cu aceeasi lista de intrare, una lua cele
-    mai NOI 20 de candele, cealalta pe cele mai VECHI 20 (adica date de acum
-    ~37 de ore la interval de 15m). Cel putin una din ele era sigur gresita.
-    Solutia: normalizam o singura data, la sursa, dupa timestamp real. Asa
-    codul devine imun la ordinea in care API-ul returneaza datele, indiferent
-    daca Bitget schimba comportamentul in viitor. Dupa normalizare,
-    candles[-1] = cea mai RECENTA candela, peste tot, mereu.
-    """
     if not candles:
         return []
     try:
@@ -520,8 +560,6 @@ def get_orderbook(symbol, limit=5):
     data = safe_request("GET", BASE_URL + path)
     return data.get("data", {}) if data and data.get("code") == "00000" else None
 
-# v24: candelele vin deja sortate cronologic crescator din get_candles(),
-# deci NU mai facem reversed() aici. [-1] = cea mai recenta, [-2] = ultima inchisa.
 def get_closes(candles): return [float(c[4]) for c in candles]
 def get_volumes(candles): return [float(c[5]) for c in candles]
 def get_highs(candles): return [float(c[2]) for c in candles]
@@ -547,25 +585,13 @@ def get_spread(symbol):
 
 # ---------------- INDICATORI ----------------
 def calculate_rsi_ema(closes, period=14):
-    """
-    v24 CORECTAT: RSI dupa formula originala a lui J. Welles Wilder.
-    Inainte foloseam netezire EMA clasica, k = 2/(period+1) = 0.133 pentru
-    period=14. Wilder foloseste k = 1/period = 0.071 - adica JUMATATE. Efectul:
-    RSI-ul nostru era de ~2x mai reactiv decat cel afisat de TradingView sau
-    Bitget, deci atingea 70 (si 30) mult mai usor si mai des decat "ar fi
-    trebuit". Asta explica de ce regula de vanzare pe RSI>70 se declansa atat
-    de devreme - indicatorul sarea peste prag la miscari mici de pret.
-    ATENTIE la interpretare: cu formula corecta, valorile RSI stau mai aproape
-    de 50, deci pragurile de cumparare (<45) si vanzare (>70) se ating MAI RAR.
-    E normal - inseamna semnale mai selective, nu ca botul s-a stricat.
-    """
     if len(closes) < period + 1: return 50.0
     deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
     gains = [max(d, 0) for d in deltas]
     losses = [abs(min(d, 0)) for d in deltas]
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
-    k = 1 / period  # Wilder's smoothing (RMA), NU 2/(period+1)
+    k = 1 / period
     for i in range(period, len(gains)):
         avg_gain = gains[i] * k + avg_gain * (1 - k)
         avg_loss = losses[i] * k + avg_loss * (1 - k)
@@ -602,7 +628,6 @@ def calculate_adx(highs, lows, closes, period=14):
         up_move, down_move = highs[i] - highs[i-1], lows[i-1] - lows[i]
         plus_dm.append(up_move if (up_move > down_move and up_move > 0) else 0)
         minus_dm.append(down_move if (down_move > up_move and down_move > 0) else 0)
-
     atr, plus_sm, minus_sm = sum(trs[:period]), sum(plus_dm[:period]), sum(minus_dm[:period])
     dx_values = []
     for i in range(period, len(trs)):
@@ -614,23 +639,12 @@ def calculate_adx(highs, lows, closes, period=14):
         di_sum = plus_di + minus_di
         dx = 100 * abs(plus_di - minus_di) / di_sum if di_sum > 0 else 0
         dx_values.append(dx)
-
     if len(dx_values) < period: return None
     adx = sum(dx_values[:period]) / period
     for dx in dx_values[period:]: adx = (adx * (period - 1) + dx) / period
     return round(adx, 2)
 
 def calculate_vwap(candles, lookback=20):
-    """
-    v24 REPARAT: acum ia efectiv ultimele `lookback` candele (cele mai recente),
-    nu cele mai vechi - vezi explicatia din normalize_candles().
-
-    Nota de precizie: asta NU e VWAP-ul institutional (care se reseteaza zilnic
-    la 00:00 UTC), ci un VWMA - medie ponderata cu volumul pe 20 de perioade.
-    Pastram VWMA intentionat: e un reper mobil, util ca filtru de mean-reversion
-    la orice ora, pe cand VWAP-ul de sesiune e practic inutil in primele ore
-    dupa miezul noptii, cand are prea putine date in spate.
-    """
     if not candles: return None
     total_pv, total_v = 0, 0
     for c in candles[-lookback:]:
@@ -655,21 +669,18 @@ def calculate_correlation(prices_a, prices_b, window=50):
     if da == 0 or db == 0: return 0.0
     return num / (da * db)
 
-# ---------------- TRADING & RISK ----------------
+# ---------------- TRADING & RISK (SPOT LONG — verificat, neschimbat) ----------------
 def place_order(symbol, side, amount_usdt=None, quantity=None):
     client_oid = str(uuid.uuid4())
     if DRY_RUN:
         logger.info(f"[DRY_RUN] Simulez {side} {symbol} ${amount_usdt or quantity}")
         return {"code": "00000", "dry_run": True, "clientOid": client_oid}
-
     path = "/api/v2/spot/trade/place-order"
     body = {"symbol": symbol, "force": "gtc", "clientOid": client_oid}
-
     if side == "buy":
         body.update(side="buy", orderType="market", size=str(round(amount_usdt * 0.999, 2)))
     else:
         body.update(side="sell", orderType="market", size=str(floor_qty(symbol, quantity)))
-
     body_str = json.dumps(body)
     headers = get_headers("POST", path, body_str)
     result = safe_request("POST", BASE_URL + path, headers=headers, data=body_str)
@@ -688,7 +699,6 @@ def compute_stop_pct(atr, price):
     return max(0.012, min(0.04, 1.5 * atr / price))
 
 def compute_trade_size(usdt_balance, total_equity, stop_pct, price, size_multiplier=1.0):
-    """v21: size_multiplier permite pozitii mai mici in regim RANGE."""
     risk_amount = total_equity * RISK_PER_TRADE * size_multiplier
     size_from_risk = risk_amount / stop_pct
     max_allowed = usdt_balance * MAX_ALLOCATION_PER_TRADE * 0.999
@@ -706,13 +716,6 @@ def check_correlation_filter(symbol):
 
 def log_trade_closed(symbol, entry, exit_price, qty, hours, reason, regime,
                       entry_strategy="?", rsi_at_entry=None, adx_at_entry=None, volume_ratio_at_entry=None):
-    """
-    v27.1: extins cu campurile de la INTRARE (entry_strategy, RSI, ADX, volum),
-    nu doar cele de la iesire. Fara astea, trades.csv nu poate raspunde la
-    intrebari de genul "tranzactiile momentum cu ADX>30 merg mai bine decat
-    cele mean-reversion cu ADX<25?" - exact analiza pe care backtesting-ul
-    trebuie sa o faca. Campurile vechi raman neschimbate, doar adaugam la coada.
-    """
     pnl_usd = (exit_price - entry) * qty
     pnl_pct = (exit_price - entry) / entry
     try:
@@ -727,7 +730,6 @@ def log_trade_closed(symbol, entry, exit_price, qty, hours, reason, regime,
             ])
     except Exception as e: logger.error(f"CSV log error: {e}")
 
-# ---------------- DRAWDOWN ZILNIC & PnL NET ----------------
 def check_and_reset_daily_pnl():
     global daily_realized_pnl, daily_pnl_date
     today = datetime.now().strftime("%Y-%m-%d")
@@ -746,22 +748,16 @@ def daily_drawdown_exceeded(total_equity):
 def net_pnl_pct(gross_pnl_pct):
     return gross_pnl_pct - (2 * FEE_RATE_PER_SIDE)
 
-
-# ---------------- FILTRU BTC ----------------
 def get_btc_health():
     candles_1h = get_candles(BTC_SYMBOL, "1h", 100)
     if not candles_1h:
         return True, "date BTC indisponibile, nu blochez"
-
     closes_1h = get_closes(candles_1h)
     ema50_1h = calculate_ema(closes_1h, EMA_PERIOD_TREND)
     price = get_current_price(BTC_SYMBOL)
-
     if price == 0 or ema50_1h is None:
         return True, "date BTC incomplete, nu blochez"
-
     ema_ok = price > ema50_1h * BTC_EMA_TOLERANCE
-
     drop_ok = True
     change = 0.0
     if len(closes_1h) > BTC_DROP_LOOKBACK_H:
@@ -770,29 +766,23 @@ def get_btc_health():
             change = (price - price_then) / price_then
             if change <= -BTC_DROP_THRESHOLD:
                 drop_ok = False
-
     if not ema_ok and not drop_ok:
         return False, f"BTC sub EMA1h si scazut {change*100:.1f}% in {BTC_DROP_LOOKBACK_H}h"
     if not ema_ok:
         return False, "BTC sub EMA1h"
     if not drop_ok:
         return False, f"BTC scazut {change*100:.1f}% in {BTC_DROP_LOOKBACK_H}h"
-
     return True, "BTC sanatos"
 
-
-# ---------------- FEAR & GREED INDEX ----------------
 _fear_greed_cache = {"value": None, "label": "", "timestamp": 0}
 
 def get_fear_greed():
     if not FEAR_GREED_ENABLED:
         return None, "", True
-
     now = time.time()
     if _fear_greed_cache["value"] is not None and (now - _fear_greed_cache["timestamp"]) < FEAR_GREED_CACHE_MINUTES * 60:
         v = _fear_greed_cache["value"]
         return v, _fear_greed_cache["label"], v > FEAR_GREED_EXTREME_THRESHOLD
-
     try:
         r = session.get("https://api.alternative.me/fng/?limit=1", timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
@@ -804,23 +794,18 @@ def get_fear_greed():
                 return value, label, value > FEAR_GREED_EXTREME_THRESHOLD
     except Exception as e:
         logger.warning(f"Fear&Greed indisponibil, ignor filtrul: {e}")
-
     return None, "", True
 
-
-# ---------------- FILTRU PIATA GENERALA ----------------
 _market_cache = {"change_24h": None, "timestamp": 0}
 
 def get_market_health():
     if not MARKET_TREND_ENABLED:
         return True, ""
-
     now = time.time()
     if _market_cache["change_24h"] is not None and (now - _market_cache["timestamp"]) < MARKET_TREND_CACHE_MINUTES * 60:
         change = _market_cache["change_24h"]
         ok = change > -MARKET_DROP_THRESHOLD * 100
         return ok, f"piata totala {change:+.1f}% in 24h"
-
     try:
         r = session.get("https://api.coingecko.com/api/v3/global", timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
@@ -832,9 +817,184 @@ def get_market_health():
                 return ok, f"piata totala {change:+.1f}% in 24h"
     except Exception as e:
         logger.warning(f"Piata generala indisponibila, ignor filtrul: {e}")
-
     return True, ""
 
+
+# ═══════════════════════════════════════════════════════════════
+# v29 NOU: FUTURES SHORT — config RSI 55-78 (testat prin backtest)
+# ═══════════════════════════════════════════════════════════════
+
+def set_futures_leverage(symbol):
+    if symbol in _futures_leverage_set:
+        return True
+    path = "/api/v2/mix/account/set-margin-mode"
+    body = {"symbol": symbol, "productType": FUTURES_PRODUCT_TYPE,
+            "marginCoin": FUTURES_MARGIN_COIN, "marginMode": FUTURES_MARGIN_MODE}
+    body_str = json.dumps(body)
+    headers = get_headers("POST", path, body_str)
+    safe_request("POST", BASE_URL + path, headers=headers, data=body_str)
+
+    path = "/api/v2/mix/account/set-leverage"
+    body = {"symbol": symbol, "productType": FUTURES_PRODUCT_TYPE,
+            "marginCoin": FUTURES_MARGIN_COIN, "leverage": str(FUTURES_LEVERAGE), "holdSide": "short"}
+    body_str = json.dumps(body)
+    headers = get_headers("POST", path, body_str)
+    result = safe_request("POST", BASE_URL + path, headers=headers, data=body_str)
+    if result and result.get("code") == "00000":
+        _futures_leverage_set.add(symbol)
+        return True
+    return False
+
+def place_futures_order(symbol, side, trade_side, size):
+    client_oid = str(uuid.uuid4())
+    if DRY_RUN:
+        logger.info(f"[DRY_RUN] Futures {side} {trade_side} {symbol} size={size}")
+        return {"code": "00000", "dry_run": True, "clientOid": client_oid}
+    path = "/api/v2/mix/order/place-order"
+    body = {
+        "symbol": symbol, "productType": FUTURES_PRODUCT_TYPE, "marginMode": FUTURES_MARGIN_MODE,
+        "marginCoin": FUTURES_MARGIN_COIN, "size": str(size), "side": side, "tradeSide": trade_side,
+        "orderType": "market", "force": "gtc", "clientOid": client_oid
+    }
+    body_str = json.dumps(body)
+    headers = get_headers("POST", path, body_str)
+    result = safe_request("POST", BASE_URL + path, headers=headers, data=body_str)
+    log_json("FUTURES_ORDER", {"symbol": symbol, "side": side, "tradeSide": trade_side, "size": size, "result": result})
+    return result if result is not None else {"code": "error", "msg": "no response"}
+
+def get_futures_balance():
+    """Balanta USDT disponibila in contul de futures (marja izolata)."""
+    if DRY_RUN:
+        return virtual_balance if virtual_balance is not None else 0.0
+    path = "/api/v2/mix/account/account"
+    full_path = f"{path}?symbol=BTCUSDT&productType={FUTURES_PRODUCT_TYPE}&marginCoin={FUTURES_MARGIN_COIN}"
+    headers = get_headers("GET", full_path)
+    data = safe_request("GET", BASE_URL + full_path, headers=headers)
+    if data and data.get("code") == "00000":
+        d = data.get("data", {})
+        return float(d.get("available", 0.0))
+    return 0.0
+
+def compute_futures_size(total_equity, price, stop_pct):
+    if total_equity <= 0 or stop_pct <= 0 or price <= 0:
+        return 0.0
+    risk_amount = total_equity * RISK_PER_TRADE * 0.8
+    size_from_risk = (risk_amount / stop_pct) / price
+    max_notional = total_equity * MAX_FUTURES_EXPOSURE_PCT
+    size_from_exposure = max_notional / price
+    size = min(size_from_risk, size_from_exposure)
+    return math.floor(size * 1000) / 1000
+
+def check_and_manage_futures_shorts(total_equity, btc_healthy):
+    global futures_positions
+    if not FUTURES_ENABLED:
+        return
+    for symbol in FUTURES_SYMBOLS:
+        try:
+            candles_15m = get_candles(symbol, "15min", 100)
+            if not candles_15m or len(candles_15m) < 30:
+                continue
+            closes = get_closes(candles_15m)
+            highs = get_highs(candles_15m)
+            lows = get_lows(candles_15m)
+            opens = get_opens(candles_15m)
+            volumes = get_volumes(candles_15m)
+            rsi_15m = calculate_rsi_ema(closes, RSI_PERIOD)
+            price = get_current_price(symbol)
+            if price <= 0:
+                continue
+
+            # --- Gestionare pozitie existenta ---
+            if symbol in futures_positions:
+                pos = futures_positions[symbol]
+                entry = pos["price"]
+                pos["peak"] = min(pos.get("peak", entry), price)
+                pnl_pct = (entry - price) / entry
+                peak_pnl = (entry - pos["peak"]) / entry
+                rise_from_peak = (price - pos["peak"]) / pos["peak"] if pos["peak"] > 0 else 0
+                stop_pct = pos.get("stop_pct", 0.025)
+                should_close, reason = False, ""
+
+                if pnl_pct <= -stop_pct:
+                    should_close, reason = True, f"🛑 SL short {pnl_pct*100:.1f}%"
+                elif pos.get("breakeven_activated") and pnl_pct <= BREAKEVEN_STOP_LEVEL:
+                    should_close, reason = True, "🔒 Stop protejat short"
+                elif peak_pnl >= TRAILING_TRIGGER and rise_from_peak >= TRAILING_DISTANCE:
+                    should_close, reason = True, f"📉 Trailing short (varf +{peak_pnl*100:.1f}%)"
+                elif rsi_15m < 30 and pnl_pct > 0.005:
+                    should_close, reason = True, f"📊 RSI supravandut {rsi_15m}"
+
+                opened_dt = datetime.fromisoformat(pos["opened_at"])
+                hours_held = (datetime.now() - opened_dt).total_seconds() / 3600
+                if hours_held >= MAX_HOLD_HOURS:
+                    should_close, reason = True, f"⏰ Time exit short ({hours_held:.1f}h)"
+
+                if not pos.get("breakeven_activated") and pnl_pct >= BREAKEVEN_TRIGGER:
+                    pos["breakeven_activated"] = True
+                    save_state()
+                    send_telegram(f"🔒 {symbol} SHORT: Stop protejat activat la +{pnl_pct*100:.1f}%")
+
+                if should_close:
+                    size = pos["quantity"]
+                    result = place_futures_order(symbol, side="sell", trade_side="close", size=size)
+                    if result.get("code") == "00000":
+                        net_pct = net_pnl_pct(pnl_pct)
+                        msg = (f"🟢 SHORT CLOSE {symbol}\n{reason}\n"
+                               f"PnL: {pnl_pct*100:+.1f}% net ~{net_pct*100:+.1f}%\n"
+                               f"{'🧪 SIM' if DRY_RUN else '💰 REAL'}")
+                        logger.info(msg)
+                        send_telegram(msg)
+                        del futures_positions[symbol]
+                        save_state()
+                continue
+
+            # --- Cautare semnal nou ---
+            if bot_paused or len(futures_positions) >= MAX_FUTURES_POSITIONS:
+                continue
+            if symbol in positions:  # nu deschidem short pe o moneda pe care o avem deja long
+                continue
+            if not btc_healthy and symbol != "BTCUSDT":
+                continue
+
+            recent_low = min(lows[-(SHORT_BREAKOUT_LOOKBACK + 1):-1])
+            breakdown_ok = price < recent_low * (1 - SHORT_BREAKOUT_MARGIN)
+            rsi_ok = SHORT_RSI_MIN < rsi_15m < SHORT_RSI_MAX
+            red_ok = True
+            if SHORT_REQUIRES_RED_CANDLE and len(opens) >= 2:
+                red_ok = closes[-2] < opens[-2]
+
+            if breakdown_ok and rsi_ok and red_ok:
+                if len(volumes) >= 22:
+                    last_vol = volumes[-2]
+                    avg_vol = sum(volumes[-21:-1]) / 20
+                    if avg_vol > 0 and last_vol < avg_vol * 0.9:
+                        continue
+
+                set_futures_leverage(symbol)
+                atr = calculate_atr(highs, lows, closes, ATR_PERIOD)
+                stop_pct = compute_stop_pct(atr, price)
+                size = compute_futures_size(total_equity, price, stop_pct)
+
+                if size * price < MIN_FUTURES_TRADE_USDT:
+                    continue
+
+                result = place_futures_order(symbol, side="sell", trade_side="open", size=size)
+                if result.get("code") == "00000":
+                    futures_positions[symbol] = {
+                        "price": price, "quantity": size, "peak": price,
+                        "opened_at": datetime.now().isoformat(),
+                        "breakeven_activated": False, "stop_pct": stop_pct,
+                        "entry_strategy": "short-breakdown"
+                    }
+                    save_state()
+                    msg = (f"🔴 SHORT OPEN {symbol}\n"
+                           f"Size: {size} @ ${price:.4f} | {FUTURES_LEVERAGE}x Izolat\n"
+                           f"RSI={rsi_15m} | Stop={stop_pct*100:.1f}%\n"
+                           f"{'🧪 SIM' if DRY_RUN else '💰 REAL'}")
+                    logger.info(msg)
+                    send_telegram(msg)
+        except Exception as e:
+            logger.error(f"❌ Eroare futures {symbol}: {e}")
 
 # ---------------- BOT LOOP ----------------
 def run_bot():
@@ -853,33 +1013,23 @@ def run_bot():
 
     balance_display = f"${virtual_balance:.2f}" if DRY_RUN else "real (din cont)"
 
-    start_msg = (f"🤖 Bot v27.1 (logging extins) pornit! Mod: {mode}\n"
+    start_msg = (f"🤖 Bot v{__version__} (Spot Long + Futures Short) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"💾 Date salvate în: {DATA_DIR}{' ✅ persistent' if DATA_DIR != '.' else ' ⚠️ EFEMER - se pierde la redeploy!'}\n"
-                 f"🔧 v27.1: trades.csv acum salvează și RSI/ADX/volum de la INTRARE, nu doar\n"
-                 f"   la ieșire — pregătire pentru backtesting (ca să vedem ce combinații chiar merg).\n"
-                 f"🔧 v27: Alocare max per tranzactie 25%→{MAX_ALLOCATION_PER_TRADE*100:.0f}%, expunere totala max 60%→{MAX_TOTAL_EXPOSURE_PCT*100:.0f}%.\n"
-                 f"   Pozitii mai mari per moneda (ex. ~$6-9 → ~$10-15), risc procentual per tranzactie neschimbat.\n"
-                 f"🔧 v26: Time exit la {MAX_HOLD_HOURS}h (7 zile), nu 48h — pozițiile stagnante nu mai sunt\n"
-                 f"   tăiate forțat în weekend, când piața oricum se mișcă mai puțin.\n"
+                 f"🔧 v29: Rate limiter, circuit breaker, health server (port {HEALTH_PORT}) pentru Northflank.\n"
+                 f"🔧 v29: FUTURES SHORT activ LIVE — {FUTURES_LEVERAGE}x Izolat pe {', '.join(FUTURES_SYMBOLS)}.\n"
+                 f"   Config RSI {SHORT_RSI_MIN}-{SHORT_RSI_MAX} (singura testata prin backtest: -3.0% full-period,\n"
+                 f"   55.5% win rate, negativ pe 5/6 ferestre OOS — FARA edge statistic dovedit, doar risc administrat).\n"
+                 f"   Long ramane pe Spot, Short pe Futures — fara conflict intre ele.\n"
+                 f"🔧 v27.1: trades.csv salveaza si RSI/ADX/volum de la INTRARE pentru backtesting.\n"
+                 f"🔧 v27: Alocare max/tranzactie {MAX_ALLOCATION_PER_TRADE*100:.0f}%, expunere totala max {MAX_TOTAL_EXPOSURE_PCT*100:.0f}%.\n"
+                 f"🔧 v26: Time exit la {MAX_HOLD_HOURS}h (7 zile).\n"
                  f"🔧 v25: stop protejat iese la +{BREAKEVEN_STOP_LEVEL*100:.1f}% brut (≈ zero net), nu la -0.5%.\n"
-                 f"   Înainte: o poziție care atinsese +1.5% putea ieși în PIERDERE (ADA: -0.8% net).\n"
-                 f"🔧 v24 — corecții de calcul:\n"
-                 f"• RSI: formula Wilder (k=1/14), ca pe TradingView. Înainte era 2x prea reactiv\n"
-                 f"   → valorile stau mai aproape de 50, deci semnale MAI RARE dar mai reale\n"
-                 f"• Candele sortate după timestamp — VWAP folosea date vechi de ~37h\n"
-                 f"• Momentum cere candelă verde (volum mare pe roșu = dump, nu breakout)\n"
-                 f"🔧 v23: RSI>70 închide poziția DOAR dacă e pe profit net (min +{RSI_SELL_MIN_NET_PROFIT*100:.1f}%).\n"
-                 f"   Înainte vindea și în pierdere — a cauzat 2 ieșiri pe minus (UNI -0.7%, ADA -0.2%).\n"
-                 f"Restul (v21):\n"
-                 f"• Volum: măsurat pe candela ÎNCHISĂ (bug reparat), prag {MIN_VOLUME_RATIO}\n"
-                 f"• Regim: TREND nu mai e obligatoriu (ADX>{ADX_TREND_THRESHOLD}); în RANGE intru cu poziție {RANGE_SIZE_MULTIPLIER*100:.0f}%\n"
-                 f"• Momentum: RSI 15m {RSI_MOMENTUM_MIN}-{RSI_MOMENTUM_MAX}, breakout pe MAXIME reale\n"
-                 f"• Corelație: prag urcat la {MAX_CORRELATION} (permite mai multe poziții)\n"
-                 f"• Fear&Greed + piață generală: dezactivate (blocau rar, cod mort)\n"
+                 f"🔧 v24: RSI formula Wilder, candele sortate cronologic, momentum cere candela verde.\n"
+                 f"🔧 v23: RSI>70 inchide pozitia DOAR daca e pe profit net (min +{RSI_SELL_MIN_NET_PROFIT*100:.1f}%).\n"
                  f"Comenzi: /pause /resume /status /stats /resetstats\n"
-                 f"Risc 2%, Alocare max/tranzactie {MAX_ALLOCATION_PER_TRADE*100:.0f}%, Expunere max {MAX_TOTAL_EXPOSURE_PCT*100:.0f}%, Daily DD max {MAX_DAILY_DRAWDOWN_PCT*100:.0f}%\n"
-                 f"Monitorizez: {', '.join(SYMBOLS)}")
+                 f"Risc 2% | Long max {MAX_CONCURRENT_POSITIONS} | Short max {MAX_FUTURES_POSITIONS}\n"
+                 f"Monitorizez Spot: {', '.join(SYMBOLS)}")
     logger.info(start_msg)
     send_telegram(start_msg)
 
@@ -892,7 +1042,9 @@ def run_bot():
             total_equity = get_total_equity(usdt_balance)
 
             dd_blocked = daily_drawdown_exceeded(total_equity)
-            logger.info(f"💰 USDT: ${usdt_balance:.2f} | Equity: ${total_equity:.2f} | Pozitii: {len(positions)}/{MAX_CONCURRENT_POSITIONS} | "
+            logger.info(f"💰 USDT: ${usdt_balance:.2f} | Equity: ${total_equity:.2f} | "
+                       f"Long: {len(positions)}/{MAX_CONCURRENT_POSITIONS} | "
+                       f"Short: {len(futures_positions)}/{MAX_FUTURES_POSITIONS} | "
                        f"PnL azi: {daily_realized_pnl:+.2f} USDT{' | 🛑 DAILY DRAWDOWN ATINS' if dd_blocked else ''}"
                        f"{' | ⏸️ PAUZAT' if bot_paused else ''}")
 
@@ -914,6 +1066,7 @@ def run_bot():
             if not mkt_ok:
                 logger.info(f"🚫 Piata generala slaba: {mkt_reason} — precautie la buy-uri noi.")
 
+            # ========== SPOT LONG (logica identica cu v27.1 verificat) ==========
             for symbol in SYMBOLS:
                 try:
                     coin = symbol.replace("USDT", "")
@@ -925,7 +1078,7 @@ def run_bot():
 
                     closes_15m, closes_1h, closes_4h = get_closes(candles_15m), get_closes(candles_1h), get_closes(candles_4h)
                     highs_1h, lows_1h, volumes_15m = get_highs(candles_1h), get_lows(candles_1h), get_volumes(candles_15m)
-                    highs_15m = get_highs(candles_15m)  # v21: pentru breakout pe maxime reale
+                    highs_15m = get_highs(candles_15m)
 
                     rsi_15m = calculate_rsi_ema(closes_15m, RSI_PERIOD)
                     rsi_1h = calculate_rsi_ema(closes_1h, RSI_PERIOD)
@@ -942,11 +1095,6 @@ def run_bot():
                     ema_ok = price > ema50_1h * EMA_TOLERANCE
                     regime = "TREND" if adx and adx > ADX_TREND_THRESHOLD else "RANGE"
 
-                    # v21 BUG REPARAT: foloseam volumes_15m[-1] = candela CURENTA,
-                    # INCOMPLETA. In primele minute ale unei candele de 15m volumul
-                    # e natural mic, deci filtrul pica aproape mereu indiferent de
-                    # piata - probabil cel mai mare blocaj tacut din bot. Acum
-                    # comparam ultima candela INCHISA cu media candelelor inchise.
                     if len(volumes_15m) >= 22:
                         last_closed_volume = volumes_15m[-2]
                         avg_volume = sum(volumes_15m[-21:-1]) / 20
@@ -954,8 +1102,6 @@ def run_bot():
                         last_closed_volume, avg_volume = 0, 0
                     volume_ok = last_closed_volume > avg_volume * MIN_VOLUME_RATIO if avg_volume > 0 else False
 
-                    # v24: a fost ultima candela INCHISA verde (close > open)?
-                    # Folosit doar de momentum - vezi MOMENTUM_REQUIRES_GREEN_CANDLE.
                     opens_15m = get_opens(candles_15m)
                     last_candle_green = (len(opens_15m) >= 2 and len(closes_15m) >= 2
                                          and closes_15m[-2] > opens_15m[-2])
@@ -971,26 +1117,15 @@ def run_bot():
 
                         in_cooldown = symbol in last_sell_time and (time.time() - last_sell_time[symbol]) / 60 < COOLDOWN_MINUTES
                         corr_ok = check_correlation_filter(symbol)
-
-                        # v21: regimul TREND nu mai e o conditie AND absoluta.
-                        # In RANGE intram doar pe mean-reversion (un breakout fara
-                        # trend confirmat e de obicei fals) si cu pozitie redusa.
                         regime_ok = (regime == "TREND") if REQUIRE_TREND_REGIME else True
                         size_multiplier = 1.0 if regime == "TREND" else RANGE_SIZE_MULTIPLIER
 
-                        # ---- Calea 1: MEAN-REVERSION - cumpara "ieftin" ----
                         mean_rev_rsi_ok = rsi_15m < RSI_BUY_15M and RSI_MIN_1H < rsi_1h < RSI_MAX_1H
                         if regime == "TREND" and adx and adx > 30:
                             mean_rev_rsi_ok = rsi_15m < RSI_BUY_15M + 5 and rsi_1h < RSI_MAX_1H + 5
                         mean_rev_vwap_ok = price < vwap * 1.01 if vwap else True
                         mean_rev_ok = mean_rev_rsi_ok and mean_rev_vwap_ok
 
-                        # ---- Calea 2: MOMENTUM - cumpara "in forta" ----
-                        # v21 doua reparatii:
-                        # 1. recent_high se calcula din CLOSES, nu din HIGHS - deci
-                        #    nu era un breakout adevarat, ci doar "inchidere peste
-                        #    inchiderile recente". Acum folosim maximele reale.
-                        # 2. fereastra RSI largita (vezi comentariile de la config).
                         momentum_ok = False
                         if MOMENTUM_ENABLED and len(highs_15m) > MOMENTUM_BREAKOUT_LOOKBACK:
                             if regime == "RANGE" and not ALLOW_MOMENTUM_IN_RANGE:
@@ -1000,8 +1135,6 @@ def run_bot():
                                 breakout_ok = price > recent_high * (1 + MOMENTUM_BREAKOUT_MARGIN)
                                 momentum_rsi_ok = (RSI_MOMENTUM_MIN < rsi_15m < RSI_MOMENTUM_MAX
                                                     and RSI_MOMENTUM_1H_MIN < rsi_1h < RSI_MOMENTUM_1H_MAX)
-                                # v24: breakout-ul trebuie confirmat de o candela verde -
-                                # altfel "volum mare" poate insemna dump, nu cerere.
                                 green_ok = last_candle_green or not MOMENTUM_REQUIRES_GREEN_CANDLE
                                 momentum_ok = breakout_ok and momentum_rsi_ok and green_ok
 
@@ -1027,14 +1160,8 @@ def run_bot():
                             if not spread_ok: blocked.append("spread")
                             if not corr_ok: blocked.append("corelatie")
                             if not regime_ok: blocked.append("regim-RANGE")
-
-                            # v21 NOU: agregam motivele intr-un contor persistent.
-                            # Asta e informatia care iti spune, dupa o saptamana de
-                            # rulare, exact ce filtru merita relaxat urmatorul -
-                            # in loc sa ghicim. Vezi comanda /stats.
                             for b in blocked:
                                 block_stats[b] = block_stats.get(b, 0) + 1
-
                             if blocked:
                                 logger.info(f"⏸️ {symbol}: nu cumpar — blocat de: {', '.join(blocked)}")
 
@@ -1051,7 +1178,6 @@ def run_bot():
 
                             if trade_amount >= MIN_TRADE_USDT:
                                 balance_before = 0.0 if DRY_RUN else get_spot_balance(coin)
-
                                 result = place_order(symbol, "buy", amount_usdt=trade_amount)
                                 if result.get("code") == "00000":
                                     if DRY_RUN:
@@ -1071,7 +1197,6 @@ def run_bot():
                                         "breakeven_activated": False, "partial_sold": False,
                                         "stop_pct": stop_pct, "entry_strategy": entry_strategy,
                                         "regime": regime,
-                                        # v27.1: pastram contextul de la intrare pentru backtesting/analiza
                                         "rsi_at_entry": rsi_15m, "adx_at_entry": adx,
                                         "volume_ratio_at_entry": volume_ratio_entry
                                     }
@@ -1119,21 +1244,16 @@ def run_bot():
 
                         if pnl_pct <= -stop_pct:
                             should_sell, reason = True, f"🛑 SL {pnl_pct*100:.1f}% (Stop: {stop_pct*100:.1f}%)"
-                        # v25: iesim la +0.2% brut (≈ zero net), nu la -0.5%.
                         elif pos.get("breakeven_activated") and pnl_pct <= BREAKEVEN_STOP_LEVEL:
                             should_sell, reason = True, f"🔒 Stop protejat la +{BREAKEVEN_STOP_LEVEL*100:.1f}% (PnL: {pnl_pct*100:+.1f}%)"
                         elif peak_pnl >= TRAILING_TRIGGER and drop_from_peak >= TRAILING_DISTANCE:
                             should_sell, reason = True, f"📉 Trailing (Vârf: +{peak_pnl*100:.1f}%, Acum: +{pnl_pct*100:.1f}%)"
-                        # v23: conditia noua - RSI vinde doar daca suntem efectiv pe
-                        # profit net. Vezi comentariul de la RSI_SELL_REQUIRES_PROFIT.
                         elif (peak_pnl < TRAILING_TRIGGER and rsi_15m > RSI_SELL
                               and drop_from_peak >= RSI_SELL_MIN_DROP_FROM_PEAK
                               and (not RSI_SELL_REQUIRES_PROFIT
                                    or net_pnl_pct(pnl_pct) >= RSI_SELL_MIN_NET_PROFIT)):
                             should_sell, reason = True, f"📊 RSI={rsi_15m} > {RSI_SELL} (net +{net_pnl_pct(pnl_pct)*100:.1f}%)"
                         else:
-                            # v23: daca RSI ar fi vandut dar pozitia e pe minus, logam -
-                            # asa vezi in loguri de cate ori te-a salvat noua regula.
                             if (peak_pnl < TRAILING_TRIGGER and rsi_15m > RSI_SELL
                                     and drop_from_peak >= RSI_SELL_MIN_DROP_FROM_PEAK):
                                 logger.info(f"🛡️ {symbol}: RSI={rsi_15m} ar fi vandut, dar PnL net "
@@ -1175,7 +1295,6 @@ def run_bot():
                                 else:
                                     error_msg = result.get('msg', 'necunoscut')
                                     logger.error(f"❌ Eroare SELL: {result}")
-
                                     if not DRY_RUN and ("insufficient" in error_msg.lower() or "balance" in error_msg.lower()):
                                         corrected = reconcile_position_balance(symbol, coin, pos)
                                         if corrected is None:
@@ -1190,6 +1309,9 @@ def run_bot():
                                 save_state()
                 except Exception as e:
                     logger.error(f"❌ Eroare {symbol}: {e}")
+
+            # ========== FUTURES SHORT (v29 nou) ==========
+            check_and_manage_futures_shorts(total_equity, btc_healthy)
 
             save_state()
             update_heartbeat("ok", {"loop": "end"})
@@ -1217,4 +1339,5 @@ def get_total_equity_bypass_dryrun():
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
+    start_health_server()
     run_bot()
