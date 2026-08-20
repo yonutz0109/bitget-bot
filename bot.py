@@ -32,10 +32,6 @@ DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 
 BASE_URL = "https://api.bitget.com"
 
-# v22: fisierele de stare se scriu intr-un director configurabil prin variabila
-# de mediu DATA_DIR. Pe Northflank atasam un volum persistent montat la /data
-# si setam DATA_DIR=/data - altfel, la fiecare redeploy filesystem-ul se
-# reseteaza, bot_state.json dispare, iar pozitiile deschise raman "orfane".
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 try:
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -70,8 +66,8 @@ MOMENTUM_BREAKOUT_LOOKBACK = 10
 MOMENTUM_BREAKOUT_MARGIN = 0.001
 
 EMA_TOLERANCE = 0.985
-EMA_PERIOD_TREND = 50  # pe 1h
-EMA_PERIOD_MACRO = 30  # pe 4h
+EMA_PERIOD_TREND = 50
+EMA_PERIOD_MACRO = 30
 
 # --- Risk Management ---
 RISK_PER_TRADE = 0.02
@@ -115,6 +111,17 @@ ADX_TREND_THRESHOLD = 20
 REQUIRE_TREND_REGIME = False
 ALLOW_MOMENTUM_IN_RANGE = False
 
+# --- Trend Continuation (v29.1 NOU) ---
+TREND_CONTINUATION_ENABLED = True
+TREND_CONTINUATION_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+TREND_CONTINUATION_ADX_MIN = 30
+TREND_CONTINUATION_PULLBACK_LOOKBACK = 8
+TREND_CONTINUATION_PULLBACK_MIN = 0.003
+TREND_CONTINUATION_PULLBACK_MAX = 0.02
+TREND_CONTINUATION_RSI_MIN = 40
+TREND_CONTINUATION_RSI_MAX = 78
+TREND_CONTINUATION_REQUIRES_GREEN_CANDLE = True
+
 # --- Filtru BTC ---
 BTC_SYMBOL = "BTCUSDT"
 BTC_DROP_THRESHOLD = 0.04
@@ -137,11 +144,6 @@ LOOP_INTERVAL = 120
 # ═══════════════════════════════════════════════════════════════
 # FUTURES SHORT — v29 NOU, LIVE
 # ═══════════════════════════════════════════════════════════════
-# Config RSI 55-78: singura varianta testata prin backtest (short_only.py,
-# BTC/ETH/SOL, walk-forward pe 6 ferestre). Rezultat: -3.0% full-period,
-# 55.5% win rate, negativ pe 5/6 ferestre OOS — NU are edge statistic
-# dovedit, doar risc administrat similar cu long-ul. Activat live la cererea
-# explicita a userului, cu constientizarea acestui rezultat.
 FUTURES_ENABLED = True
 FUTURES_LEVERAGE = 2
 FUTURES_MARGIN_MODE = "isolated"
@@ -162,7 +164,7 @@ if not DRY_RUN and not (API_KEY and SECRET_KEY and PASSPHRASE):
     print("EROARE: lipsesc credențialele Bitget și DRY_RUN=false. Opresc botul.")
     sys.exit(1)
 
-# ---------------- LOGGING (v29: rotating, nu creste la nesfarsit) ----------------
+# ---------------- LOGGING ----------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
@@ -177,11 +179,6 @@ def log_json(event_type, data):
     entry = {"timestamp": datetime.now().isoformat(), "event": event_type, "data": data}
     logger.info(json.dumps(entry))
 
-# ═══════════════════════════════════════════════════════════════
-# v29 NOU: RATE LIMITER (token bucket, 8 req/s conservator fata de limita
-# Bitget de 10 req/s) — protejeaza impotriva HTTP 429 cand short-ul futures
-# adauga apeluri API in plus fata de spot.
-# ═══════════════════════════════════════════════════════════════
 class RateLimiter:
     def __init__(self, rate=8.0, per=1.0):
         self._rate = rate
@@ -208,16 +205,10 @@ class RateLimiter:
 
 rate_limiter = RateLimiter(rate=8.0, per=1.0)
 
-# ---------------- HTTP SESSION ----------------
 session = requests.Session()
 retry_cfg = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retry_cfg))
 
-# ═══════════════════════════════════════════════════════════════
-# v29 NOU: CIRCUIT BREAKER — daca API-ul Bitget da erori consecutive (ex.
-# probleme de retea, mentenanta), oprim temporar cererile in loc sa
-# bombardam API-ul si sa riscam ban temporar de IP.
-# ═══════════════════════════════════════════════════════════════
 class CircuitBreaker:
     def __init__(self, threshold=5, cooldown_seconds=60.0):
         self.threshold = threshold
@@ -354,7 +345,6 @@ def get_headers(method, path, body=""):
     }
 
 def safe_request(method, url, headers=None, data=None, params=None):
-    # v29: rate limiting + circuit breaker in jurul cererii existente
     if circuit_breaker.is_open():
         logger.warning("Circuit breaker DESCHIS — sar peste cerere")
         return None
@@ -382,9 +372,8 @@ def safe_request(method, url, headers=None, data=None, params=None):
         circuit_breaker.record_failure()
         return None
 
-# ---------------- HEARTBEAT & STATE ----------------
 positions = {}
-futures_positions = {}   # v29 NOU: pozitii short pe futures
+futures_positions = {}
 last_sell_time = {}
 price_history = {}
 virtual_balance = None
@@ -395,7 +384,7 @@ telegram_last_update_id = 0
 bot_start_time = 0.0
 block_stats = {}
 block_stats_since = None
-_futures_leverage_set = set()  # v29: nu mai setam leverage-ul la fiecare ciclu
+_futures_leverage_set = set()
 
 def update_heartbeat(status="ok", extra=None):
     try:
@@ -405,7 +394,6 @@ def update_heartbeat(status="ok", extra=None):
         with open(HEARTBEAT_FILE, "w") as f: json.dump(hb, f)
     except Exception as e: logger.error(f"Heartbeat error: {e}")
 
-# v29 NOU: server HTTP minimal pentru health-check-urile Northflank
 class HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         try:
@@ -488,7 +476,6 @@ def handle_shutdown(signum, frame):
     save_state()
     sys.exit(0)
 
-# ---------------- PRECIZIE & API ----------------
 quantity_precision = {}
 
 def load_symbol_precision():
@@ -583,7 +570,6 @@ def get_spread(symbol):
     mid = (bid + ask) / 2
     return (ask - bid) / mid if mid > 0 else 1.0
 
-# ---------------- INDICATORI ----------------
 def calculate_rsi_ema(closes, period=14):
     if len(closes) < period + 1: return 50.0
     deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
@@ -669,7 +655,6 @@ def calculate_correlation(prices_a, prices_b, window=50):
     if da == 0 or db == 0: return 0.0
     return num / (da * db)
 
-# ---------------- TRADING & RISK (SPOT LONG — verificat, neschimbat) ----------------
 def place_order(symbol, side, amount_usdt=None, quantity=None):
     client_oid = str(uuid.uuid4())
     if DRY_RUN:
@@ -820,10 +805,6 @@ def get_market_health():
     return True, ""
 
 
-# ═══════════════════════════════════════════════════════════════
-# v29 NOU: FUTURES SHORT — config RSI 55-78 (testat prin backtest)
-# ═══════════════════════════════════════════════════════════════
-
 def set_futures_leverage(symbol):
     if symbol in _futures_leverage_set:
         return True
@@ -863,7 +844,6 @@ def place_futures_order(symbol, side, trade_side, size):
     return result if result is not None else {"code": "error", "msg": "no response"}
 
 def get_futures_balance():
-    """Balanta USDT disponibila in contul de futures (marja izolata)."""
     if DRY_RUN:
         return virtual_balance if virtual_balance is not None else 0.0
     path = "/api/v2/mix/account/account"
@@ -904,7 +884,6 @@ def check_and_manage_futures_shorts(total_equity, btc_healthy):
             if price <= 0:
                 continue
 
-            # --- Gestionare pozitie existenta ---
             if symbol in futures_positions:
                 pos = futures_positions[symbol]
                 entry = pos["price"]
@@ -948,10 +927,9 @@ def check_and_manage_futures_shorts(total_equity, btc_healthy):
                         save_state()
                 continue
 
-            # --- Cautare semnal nou ---
             if bot_paused or len(futures_positions) >= MAX_FUTURES_POSITIONS:
                 continue
-            if symbol in positions:  # nu deschidem short pe o moneda pe care o avem deja long
+            if symbol in positions:
                 continue
             if not btc_healthy and symbol != "BTCUSDT":
                 continue
@@ -996,7 +974,6 @@ def check_and_manage_futures_shorts(total_equity, btc_healthy):
         except Exception as e:
             logger.error(f"❌ Eroare futures {symbol}: {e}")
 
-# ---------------- BOT LOOP ----------------
 def run_bot():
     global virtual_balance, daily_realized_pnl, daily_pnl_date, bot_start_time, block_stats_since
     bot_start_time = time.time()
@@ -1017,6 +994,9 @@ def run_bot():
                  f"Balance start: {balance_display}\n"
                  f"💾 Date salvate în: {DATA_DIR}{' ✅ persistent' if DATA_DIR != '.' else ' ⚠️ EFEMER - se pierde la redeploy!'}\n"
                  f"🔧 v29: Rate limiter, circuit breaker, health server (port {HEALTH_PORT}) pentru Northflank.\n"
+                 f"🔧 v29.1: Trend Continuation NOU — doar BTC/ETH, cumpara pe mic pullback (0.3-2%)\n"
+                 f"   in trend puternic (ADX>{TREND_CONTINUATION_ADX_MIN}), fara banda RSI ingusta a momentum-ului.\n"
+                 f"   Safety identic: stop-loss/breakeven/trailing/partial la fel ca restul pozitiilor.\n"
                  f"🔧 v29: FUTURES SHORT activ LIVE — {FUTURES_LEVERAGE}x Izolat pe {', '.join(FUTURES_SYMBOLS)}.\n"
                  f"   Config RSI {SHORT_RSI_MIN}-{SHORT_RSI_MAX} (singura testata prin backtest: -3.0% full-period,\n"
                  f"   55.5% win rate, negativ pe 5/6 ferestre OOS — FARA edge statistic dovedit, doar risc administrat).\n"
@@ -1066,7 +1046,7 @@ def run_bot():
             if not mkt_ok:
                 logger.info(f"🚫 Piata generala slaba: {mkt_reason} — precautie la buy-uri noi.")
 
-            # ========== SPOT LONG (logica identica cu v27.1 verificat) ==========
+            # ========== SPOT LONG ==========
             for symbol in SYMBOLS:
                 try:
                     coin = symbol.replace("USDT", "")
@@ -1138,8 +1118,25 @@ def run_bot():
                                 green_ok = last_candle_green or not MOMENTUM_REQUIRES_GREEN_CANDLE
                                 momentum_ok = breakout_ok and momentum_rsi_ok and green_ok
 
-                        entry_ok = mean_rev_ok or momentum_ok
-                        entry_strategy = "momentum" if (momentum_ok and not mean_rev_ok) else "mean-reversion"
+                        # v29.1 NOU: trend continuation, doar BTC/ETH
+                        trend_cont_ok = False
+                        if (TREND_CONTINUATION_ENABLED and symbol in TREND_CONTINUATION_SYMBOLS
+                                and len(highs_15m) > TREND_CONTINUATION_PULLBACK_LOOKBACK):
+                            tc_trend_ok = macro_uptrend and ema_ok and adx and adx > TREND_CONTINUATION_ADX_MIN
+                            recent_high_tc = max(highs_15m[-(TREND_CONTINUATION_PULLBACK_LOOKBACK + 1):-1])
+                            pullback_pct = (recent_high_tc - price) / recent_high_tc if recent_high_tc > 0 else 0
+                            pullback_ok = TREND_CONTINUATION_PULLBACK_MIN <= pullback_pct <= TREND_CONTINUATION_PULLBACK_MAX
+                            tc_rsi_ok = TREND_CONTINUATION_RSI_MIN < rsi_15m < TREND_CONTINUATION_RSI_MAX
+                            tc_green_ok = last_candle_green or not TREND_CONTINUATION_REQUIRES_GREEN_CANDLE
+                            trend_cont_ok = tc_trend_ok and pullback_ok and tc_rsi_ok and tc_green_ok
+
+                        entry_ok = mean_rev_ok or momentum_ok or trend_cont_ok
+                        if momentum_ok and not mean_rev_ok and not trend_cont_ok:
+                            entry_strategy = "momentum"
+                        elif trend_cont_ok and not mean_rev_ok and not momentum_ok:
+                            entry_strategy = "trend-continuation"
+                        else:
+                            entry_strategy = "mean-reversion"
 
                         all_ok = (not bot_paused and not dd_blocked and btc_healthy and fg_ok and mkt_ok
                                   and macro_uptrend and ema_ok and not in_cooldown and volume_ok
@@ -1310,7 +1307,7 @@ def run_bot():
                 except Exception as e:
                     logger.error(f"❌ Eroare {symbol}: {e}")
 
-            # ========== FUTURES SHORT (v29 nou) ==========
+            # ========== FUTURES SHORT ==========
             check_and_manage_futures_shorts(total_equity, btc_healthy)
 
             save_state()
