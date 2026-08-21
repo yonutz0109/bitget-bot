@@ -20,7 +20,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from logging.handlers import RotatingFileHandler
 
-__version__ = "29.0"
+__version__ = "29.2"
 
 # ---------------- CONFIG ----------------
 API_KEY = os.environ.get("BITGET_API_KEY", "")
@@ -57,17 +57,21 @@ RSI_MAX_1H = 60
 RSI_SELL = 70
 
 # --- Strategie Momentum ---
+# v29.2: RSI_MOMENTUM_1H_MAX urcat de la 68 la 75. La rally-uri sustinute
+# (BTC +8%, ETH +4.7% intr-o zi), RSI-ul pe 1h satureaza rapid peste 68,
+# blocand momentum-ul chiar daca pe 15m mai era loc. Daca genereaza pierderi
+# mari fata de precautia anterioara, revenim la 68.
 MOMENTUM_ENABLED = True
 RSI_MOMENTUM_MIN = 50
 RSI_MOMENTUM_MAX = 72
 RSI_MOMENTUM_1H_MIN = 35
-RSI_MOMENTUM_1H_MAX = 68
+RSI_MOMENTUM_1H_MAX = 75
 MOMENTUM_BREAKOUT_LOOKBACK = 10
 MOMENTUM_BREAKOUT_MARGIN = 0.001
 
 EMA_TOLERANCE = 0.985
-EMA_PERIOD_TREND = 50
-EMA_PERIOD_MACRO = 30
+EMA_PERIOD_TREND = 50  # pe 1h
+EMA_PERIOD_MACRO = 30  # pe 4h
 
 # --- Risk Management ---
 RISK_PER_TRADE = 0.02
@@ -993,8 +997,10 @@ def run_bot():
     start_msg = (f"🤖 Bot v{__version__} (Spot Long + Futures Short) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"💾 Date salvate în: {DATA_DIR}{' ✅ persistent' if DATA_DIR != '.' else ' ⚠️ EFEMER - se pierde la redeploy!'}\n"
+                 f"🔧 v29.2: RSI_MOMENTUM_1H_MAX urcat 68→75 — momentum-ul nu mai e blocat de RSI\n"
+                 f"   1h saturat pe rally-uri sustinute (BTC +8%, ETH +4.7%/zi).\n"
                  f"🔧 v29: Rate limiter, circuit breaker, health server (port {HEALTH_PORT}) pentru Northflank.\n"
-                 f"🔧 v29.1: Trend Continuation NOU — doar BTC/ETH, cumpara pe mic pullback (0.3-2%)\n"
+                 f"🔧 v29.1: Trend Continuation — doar BTC/ETH, cumpara pe mic pullback (0.3-2%)\n"
                  f"   in trend puternic (ADX>{TREND_CONTINUATION_ADX_MIN}), fara banda RSI ingusta a momentum-ului.\n"
                  f"   Safety identic: stop-loss/breakeven/trailing/partial la fel ca restul pozitiilor.\n"
                  f"🔧 v29: FUTURES SHORT activ LIVE — {FUTURES_LEVERAGE}x Izolat pe {', '.join(FUTURES_SYMBOLS)}.\n"
@@ -1118,7 +1124,6 @@ def run_bot():
                                 green_ok = last_candle_green or not MOMENTUM_REQUIRES_GREEN_CANDLE
                                 momentum_ok = breakout_ok and momentum_rsi_ok and green_ok
 
-                        # v29.1 NOU: trend continuation, doar BTC/ETH
                         trend_cont_ok = False
                         if (TREND_CONTINUATION_ENABLED and symbol in TREND_CONTINUATION_SYMBOLS
                                 and len(highs_15m) > TREND_CONTINUATION_PULLBACK_LOOKBACK):
