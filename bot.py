@@ -20,7 +20,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from logging.handlers import RotatingFileHandler
 
-__version__ = "29.2"
+__version__ = "29.3"
 
 # ---------------- CONFIG ----------------
 API_KEY = os.environ.get("BITGET_API_KEY", "")
@@ -85,7 +85,14 @@ FEE_RATE_PER_SIDE = 0.001
 # --- Stop Loss & Trailing ---
 TRAILING_TRIGGER = 0.025
 TRAILING_DISTANCE = 0.015
-BREAKEVEN_TRIGGER = 0.015
+# v29.3: BREAKEVEN_TRIGGER coborat de la 1.5% la 0.5%. Inainte, o pozitie care
+# urca doar putin (ex. +0.5-0.8%) nu avea nicio plasa de siguranta pana nu
+# ajungea la 1.5% - daca scadea inapoi, tot castigul mic se pierdea (doar
+# stop-loss-ul larg -1.2%/-4% era activ). Acum orice pozitie care atinge
+# +0.5% primeste o plasa la +0.2% (aproape zero net). Restul comportamentului
+# ramane identic: trailing la 2.5%, partial profit la 2.5%, nimic nu vinde
+# mai devreme decat inainte - doar profiturile mici capata si ele o baza.
+BREAKEVEN_TRIGGER = 0.005
 BREAKEVEN_STOP_LEVEL = 0.002
 PARTIAL_PROFIT_TRIGGER = 0.025
 RSI_SELL_MIN_DROP_FROM_PEAK = 0.003
@@ -997,10 +1004,11 @@ def run_bot():
     start_msg = (f"🤖 Bot v{__version__} (Spot Long + Futures Short) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"💾 Date salvate în: {DATA_DIR}{' ✅ persistent' if DATA_DIR != '.' else ' ⚠️ EFEMER - se pierde la redeploy!'}\n"
-                 f"🔧 v29.2: RSI_MOMENTUM_1H_MAX urcat 68→75 — momentum-ul nu mai e blocat de RSI\n"
-                 f"   1h saturat pe rally-uri sustinute (BTC +8%, ETH +4.7%/zi).\n"
+                 f"🔧 v29.3: Stop protejat pornit acum la +{BREAKEVEN_TRIGGER*100:.1f}% (era 1.5%) — profiturile\n"
+                 f"   mici primesc si ele o plasa de siguranta la +{BREAKEVEN_STOP_LEVEL*100:.1f}%, nu doar cele mari.\n"
+                 f"🔧 v29.2: RSI_MOMENTUM_1H_MAX urcat 68→{RSI_MOMENTUM_1H_MAX} — momentum-ul nu mai e blocat de RSI 1h saturat pe rally-uri.\n"
                  f"🔧 v29: Rate limiter, circuit breaker, health server (port {HEALTH_PORT}) pentru Northflank.\n"
-                 f"🔧 v29.1: Trend Continuation — doar BTC/ETH, cumpara pe mic pullback (0.3-2%)\n"
+                 f"🔧 v29.1: Trend Continuation NOU — doar BTC/ETH, cumpara pe mic pullback (0.3-2%)\n"
                  f"   in trend puternic (ADX>{TREND_CONTINUATION_ADX_MIN}), fara banda RSI ingusta a momentum-ului.\n"
                  f"   Safety identic: stop-loss/breakeven/trailing/partial la fel ca restul pozitiilor.\n"
                  f"🔧 v29: FUTURES SHORT activ LIVE — {FUTURES_LEVERAGE}x Izolat pe {', '.join(FUTURES_SYMBOLS)}.\n"
