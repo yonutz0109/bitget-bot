@@ -20,7 +20,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from logging.handlers import RotatingFileHandler
 
-__version__ = "29.3"
+__version__ = "29.4"
 
 # ---------------- CONFIG ----------------
 API_KEY = os.environ.get("BITGET_API_KEY", "")
@@ -57,10 +57,6 @@ RSI_MAX_1H = 60
 RSI_SELL = 70
 
 # --- Strategie Momentum ---
-# v29.2: RSI_MOMENTUM_1H_MAX urcat de la 68 la 75. La rally-uri sustinute
-# (BTC +8%, ETH +4.7% intr-o zi), RSI-ul pe 1h satureaza rapid peste 68,
-# blocand momentum-ul chiar daca pe 15m mai era loc. Daca genereaza pierderi
-# mari fata de precautia anterioara, revenim la 68.
 MOMENTUM_ENABLED = True
 RSI_MOMENTUM_MIN = 50
 RSI_MOMENTUM_MAX = 72
@@ -70,8 +66,8 @@ MOMENTUM_BREAKOUT_LOOKBACK = 10
 MOMENTUM_BREAKOUT_MARGIN = 0.001
 
 EMA_TOLERANCE = 0.985
-EMA_PERIOD_TREND = 50  # pe 1h
-EMA_PERIOD_MACRO = 30  # pe 4h
+EMA_PERIOD_TREND = 50
+EMA_PERIOD_MACRO = 30
 
 # --- Risk Management ---
 RISK_PER_TRADE = 0.02
@@ -84,20 +80,31 @@ FEE_RATE_PER_SIDE = 0.001
 
 # --- Stop Loss & Trailing ---
 TRAILING_TRIGGER = 0.025
-TRAILING_DISTANCE = 0.015
-# v29.3: BREAKEVEN_TRIGGER coborat de la 1.5% la 0.5%. Inainte, o pozitie care
-# urca doar putin (ex. +0.5-0.8%) nu avea nicio plasa de siguranta pana nu
-# ajungea la 1.5% - daca scadea inapoi, tot castigul mic se pierdea (doar
-# stop-loss-ul larg -1.2%/-4% era activ). Acum orice pozitie care atinge
-# +0.5% primeste o plasa la +0.2% (aproape zero net). Restul comportamentului
-# ramane identic: trailing la 2.5%, partial profit la 2.5%, nimic nu vinde
-# mai devreme decat inainte - doar profiturile mici capata si ele o baza.
-BREAKEVEN_TRIGGER = 0.005
-BREAKEVEN_STOP_LEVEL = 0.002
+TRAILING_DISTANCE_BASE = 0.015
+TRAILING_DISTANCE_MAX = 0.035
+TRAILING_ADX_REF = 20
+TRAILING_DISTANCE = TRAILING_DISTANCE_BASE
+
+def compute_trailing_distance(adx):
+    if not adx or adx <= TRAILING_ADX_REF:
+        return TRAILING_DISTANCE_BASE
+    extra = (adx - TRAILING_ADX_REF) / 100.0
+    return min(TRAILING_DISTANCE_BASE * (1 + extra), TRAILING_DISTANCE_MAX)
+
+PROTECTED_STOP_LEVELS = [
+    (0.005, 0.003),
+    (0.010, 0.006),
+]
+BREAKEVEN_TRIGGER = PROTECTED_STOP_LEVELS[0][0]
+BREAKEVEN_STOP_LEVEL = PROTECTED_STOP_LEVELS[0][1]
 PARTIAL_PROFIT_TRIGGER = 0.025
 RSI_SELL_MIN_DROP_FROM_PEAK = 0.003
 RSI_SELL_REQUIRES_PROFIT = True
 RSI_SELL_MIN_NET_PROFIT = 0.002
+
+REENTRY_ENABLED = True
+REENTRY_WINDOW_MINUTES = 60
+REENTRY_ADX_MIN = 30
 
 # --- Time & Position ---
 COOLDOWN_MINUTES = 45
@@ -122,7 +129,7 @@ ADX_TREND_THRESHOLD = 20
 REQUIRE_TREND_REGIME = False
 ALLOW_MOMENTUM_IN_RANGE = False
 
-# --- Trend Continuation (v29.1 NOU) ---
+# --- Trend Continuation ---
 TREND_CONTINUATION_ENABLED = True
 TREND_CONTINUATION_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 TREND_CONTINUATION_ADX_MIN = 30
@@ -132,6 +139,16 @@ TREND_CONTINUATION_PULLBACK_MAX = 0.02
 TREND_CONTINUATION_RSI_MIN = 40
 TREND_CONTINUATION_RSI_MAX = 78
 TREND_CONTINUATION_REQUIRES_GREEN_CANDLE = True
+
+# --- Short Continuation (v29.4 NOU) ---
+SHORT_CONTINUATION_ENABLED = True
+SHORT_CONTINUATION_ADX_MIN = 30
+SHORT_CONTINUATION_BOUNCE_LOOKBACK = 8
+SHORT_CONTINUATION_BOUNCE_MIN = 0.003
+SHORT_CONTINUATION_BOUNCE_MAX = 0.02
+SHORT_CONTINUATION_RSI_MIN = 22
+SHORT_CONTINUATION_RSI_MAX = 60
+SHORT_CONTINUATION_REQUIRES_RED_CANDLE = True
 
 # --- Filtru BTC ---
 BTC_SYMBOL = "BTCUSDT"
@@ -396,6 +413,8 @@ bot_start_time = 0.0
 block_stats = {}
 block_stats_since = None
 _futures_leverage_set = set()
+reentry_armed = {}
+reentry_armed_short = {}
 
 def update_heartbeat(status="ok", extra=None):
     try:
@@ -439,6 +458,7 @@ def load_state():
     global positions, futures_positions, last_sell_time, price_history, virtual_balance
     global daily_realized_pnl, daily_pnl_date, bot_paused, telegram_last_update_id
     global block_stats, block_stats_since, _futures_leverage_set
+    global reentry_armed, reentry_armed_short
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f: saved = json.load(f)
@@ -453,6 +473,8 @@ def load_state():
             block_stats = saved.get("block_stats", {})
             block_stats_since = saved.get("block_stats_since", None)
             _futures_leverage_set = set(saved.get("_futures_leverage_set", []))
+            reentry_armed = saved.get("reentry_armed", {})
+            reentry_armed_short = saved.get("reentry_armed_short", {})
             ph_raw = saved.get("price_history", {})
             price_history = {k: deque(v, maxlen=CORRELATION_WINDOW*2) for k, v in ph_raw.items()}
             logger.info(f"Stare încărcată: {len(positions)} long + {len(futures_positions)} short"
@@ -476,7 +498,9 @@ def save_state():
             "block_stats": block_stats,
             "block_stats_since": block_stats_since,
             "price_history": {k: list(v) for k, v in price_history.items()},
-            "_futures_leverage_set": list(_futures_leverage_set)
+            "_futures_leverage_set": list(_futures_leverage_set),
+            "reentry_armed": reentry_armed,
+            "reentry_armed_short": reentry_armed_short
         }
         with open(tmp, "w") as f: json.dump(state, f, indent=2)
         os.replace(tmp, STATE_FILE)
@@ -891,6 +915,7 @@ def check_and_manage_futures_shorts(total_equity, btc_healthy):
             opens = get_opens(candles_15m)
             volumes = get_volumes(candles_15m)
             rsi_15m = calculate_rsi_ema(closes, RSI_PERIOD)
+            adx_short = calculate_adx(highs, lows, closes, ADX_PERIOD)
             price = get_current_price(symbol)
             if price <= 0:
                 continue
@@ -903,14 +928,24 @@ def check_and_manage_futures_shorts(total_equity, btc_healthy):
                 peak_pnl = (entry - pos["peak"]) / entry
                 rise_from_peak = (price - pos["peak"]) / pos["peak"] if pos["peak"] > 0 else 0
                 stop_pct = pos.get("stop_pct", 0.025)
+                trailing_distance_s = compute_trailing_distance(adx_short)
                 should_close, reason = False, ""
+
+                for trig, floor in PROTECTED_STOP_LEVELS:
+                    if pnl_pct >= trig and (pos.get("protected_floor") is None or floor > pos["protected_floor"]):
+                        pos["protected_floor"] = floor
+                        pos["breakeven_activated"] = True
+                        save_state()
+                        send_telegram(f"🔒 {symbol} SHORT: Stop protejat la +{floor*100:.1f}% (PnL curent +{pnl_pct*100:.1f}%)")
+
+                protected_floor_s = pos.get("protected_floor")
 
                 if pnl_pct <= -stop_pct:
                     should_close, reason = True, f"🛑 SL short {pnl_pct*100:.1f}%"
-                elif pos.get("breakeven_activated") and pnl_pct <= BREAKEVEN_STOP_LEVEL:
-                    should_close, reason = True, "🔒 Stop protejat short"
-                elif peak_pnl >= TRAILING_TRIGGER and rise_from_peak >= TRAILING_DISTANCE:
-                    should_close, reason = True, f"📉 Trailing short (varf +{peak_pnl*100:.1f}%)"
+                elif protected_floor_s is not None and pnl_pct <= protected_floor_s:
+                    should_close, reason = True, f"🔒 Stop protejat short la +{protected_floor_s*100:.1f}% (PnL: {pnl_pct*100:+.1f}%)"
+                elif peak_pnl >= TRAILING_TRIGGER and rise_from_peak >= trailing_distance_s:
+                    should_close, reason = True, f"📉 Trailing short (varf +{peak_pnl*100:.1f}%, dist:{trailing_distance_s*100:.1f}%)"
                 elif rsi_15m < 30 and pnl_pct > 0.005:
                     should_close, reason = True, f"📊 RSI supravandut {rsi_15m}"
 
@@ -918,11 +953,6 @@ def check_and_manage_futures_shorts(total_equity, btc_healthy):
                 hours_held = (datetime.now() - opened_dt).total_seconds() / 3600
                 if hours_held >= MAX_HOLD_HOURS:
                     should_close, reason = True, f"⏰ Time exit short ({hours_held:.1f}h)"
-
-                if not pos.get("breakeven_activated") and pnl_pct >= BREAKEVEN_TRIGGER:
-                    pos["breakeven_activated"] = True
-                    save_state()
-                    send_telegram(f"🔒 {symbol} SHORT: Stop protejat activat la +{pnl_pct*100:.1f}%")
 
                 if should_close:
                     size = pos["quantity"]
@@ -934,6 +964,13 @@ def check_and_manage_futures_shorts(total_equity, btc_healthy):
                                f"{'🧪 SIM' if DRY_RUN else '💰 REAL'}")
                         logger.info(msg)
                         send_telegram(msg)
+
+                        trend_still_bearish = (REENTRY_ENABLED and "Trailing" in reason
+                                                and adx_short and adx_short > REENTRY_ADX_MIN)
+                        if trend_still_bearish:
+                            reentry_armed_short[symbol] = time.time() + REENTRY_WINDOW_MINUTES * 60
+                            logger.info(f"🔄 {symbol} SHORT: iesire prin trailing, trend inca puternic (ADX={adx_short}) — re-intrare armata {REENTRY_WINDOW_MINUTES}min.")
+
                         del futures_positions[symbol]
                         save_state()
                 continue
@@ -951,13 +988,43 @@ def check_and_manage_futures_shorts(total_equity, btc_healthy):
             red_ok = True
             if SHORT_REQUIRES_RED_CANDLE and len(opens) >= 2:
                 red_ok = closes[-2] < opens[-2]
+            breakdown_signal = breakdown_ok and rsi_ok and red_ok
 
-            if breakdown_ok and rsi_ok and red_ok:
-                if len(volumes) >= 22:
+            short_cont_ok = False
+            if (SHORT_CONTINUATION_ENABLED and len(lows) > SHORT_CONTINUATION_BOUNCE_LOOKBACK):
+                sc_trend_ok = adx_short and adx_short > SHORT_CONTINUATION_ADX_MIN
+                recent_low_sc = min(lows[-(SHORT_CONTINUATION_BOUNCE_LOOKBACK + 1):-1])
+                bounce_pct = (price - recent_low_sc) / recent_low_sc if recent_low_sc > 0 else 0
+                bounce_ok = SHORT_CONTINUATION_BOUNCE_MIN <= bounce_pct <= SHORT_CONTINUATION_BOUNCE_MAX
+                sc_rsi_ok = SHORT_CONTINUATION_RSI_MIN < rsi_15m < SHORT_CONTINUATION_RSI_MAX
+                sc_red_ok = True
+                if SHORT_CONTINUATION_REQUIRES_RED_CANDLE and len(opens) >= 2:
+                    sc_red_ok = closes[-2] < opens[-2]
+                short_cont_ok = sc_trend_ok and bounce_ok and sc_rsi_ok and sc_red_ok
+
+            reentry_ok_s = False
+            if REENTRY_ENABLED and symbol in reentry_armed_short:
+                if time.time() < reentry_armed_short[symbol]:
+                    reentry_ok_s = adx_short and adx_short > REENTRY_ADX_MIN
+                if not reentry_ok_s:
+                    del reentry_armed_short[symbol]
+
+            entry_signal = breakdown_signal or short_cont_ok or reentry_ok_s
+
+            if entry_signal:
+                if breakdown_signal and not short_cont_ok and not reentry_ok_s and len(volumes) >= 22:
                     last_vol = volumes[-2]
                     avg_vol = sum(volumes[-21:-1]) / 20
                     if avg_vol > 0 and last_vol < avg_vol * 0.9:
-                        continue
+                        entry_signal = False
+
+            if entry_signal:
+                if reentry_ok_s:
+                    entry_strategy_s = "trend-reentry"
+                elif short_cont_ok and not breakdown_signal:
+                    entry_strategy_s = "short-continuation"
+                else:
+                    entry_strategy_s = "short-breakdown"
 
                 set_futures_leverage(symbol)
                 atr = calculate_atr(highs, lows, closes, ATR_PERIOD)
@@ -972,13 +1039,14 @@ def check_and_manage_futures_shorts(total_equity, btc_healthy):
                     futures_positions[symbol] = {
                         "price": price, "quantity": size, "peak": price,
                         "opened_at": datetime.now().isoformat(),
-                        "breakeven_activated": False, "stop_pct": stop_pct,
-                        "entry_strategy": "short-breakdown"
+                        "breakeven_activated": False, "protected_floor": None, "stop_pct": stop_pct,
+                        "entry_strategy": entry_strategy_s
                     }
+                    reentry_armed_short.pop(symbol, None)
                     save_state()
-                    msg = (f"🔴 SHORT OPEN {symbol}\n"
+                    msg = (f"🔴 SHORT OPEN {symbol} {entry_strategy_s}\n"
                            f"Size: {size} @ ${price:.4f} | {FUTURES_LEVERAGE}x Izolat\n"
-                           f"RSI={rsi_15m} | Stop={stop_pct*100:.1f}%\n"
+                           f"RSI={rsi_15m}, ADX={adx_short} | Stop={stop_pct*100:.1f}%\n"
                            f"{'🧪 SIM' if DRY_RUN else '💰 REAL'}")
                     logger.info(msg)
                     send_telegram(msg)
@@ -1004,11 +1072,18 @@ def run_bot():
     start_msg = (f"🤖 Bot v{__version__} (Spot Long + Futures Short) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"💾 Date salvate în: {DATA_DIR}{' ✅ persistent' if DATA_DIR != '.' else ' ⚠️ EFEMER - se pierde la redeploy!'}\n"
-                 f"🔧 v29.3: Stop protejat pornit acum la +{BREAKEVEN_TRIGGER*100:.1f}% (era 1.5%) — profiturile\n"
-                 f"   mici primesc si ele o plasa de siguranta la +{BREAKEVEN_STOP_LEVEL*100:.1f}%, nu doar cele mari.\n"
+                 f"🔧 v29.4 NOU:\n"
+                 f"• Plase de siguranta in trepte: +0.5%→+0.3%, +1.0%→+0.6% (nu doar un prag fix).\n"
+                 f"• Trailing dinamic: distanta creste cu ADX ({TRAILING_DISTANCE_BASE*100:.1f}%→{TRAILING_DISTANCE_MAX*100:.1f}% max) — nu mai scoate\n"
+                 f"  pozitii din trenduri lungi la orice recul normal (ex. BTC 64k→80k, ratat aproape complet).\n"
+                 f"• Re-intrare automata (long si short): daca trailing-ul inchide o pozitie dar\n"
+                 f"  trendul ramane confirmat (ADX>{REENTRY_ADX_MIN}), cumpara/vinde din nou fara sa astepte semnal nou.\n"
+                 f"• Short-Continuation NOU: oglinda short a Trend Continuation — prinde caderi\n"
+                 f"  sustinute (ex. BTC 80k→78k), nu doar inceputul lor.\n"
+                 f"🔧 v29.3: Stop protejat de baza acum la +0.5% (era 1.5%).\n"
                  f"🔧 v29.2: RSI_MOMENTUM_1H_MAX urcat 68→{RSI_MOMENTUM_1H_MAX} — momentum-ul nu mai e blocat de RSI 1h saturat pe rally-uri.\n"
                  f"🔧 v29: Rate limiter, circuit breaker, health server (port {HEALTH_PORT}) pentru Northflank.\n"
-                 f"🔧 v29.1: Trend Continuation NOU — doar BTC/ETH, cumpara pe mic pullback (0.3-2%)\n"
+                 f"🔧 v29.1: Trend Continuation — doar BTC/ETH, cumpara pe mic pullback (0.3-2%)\n"
                  f"   in trend puternic (ADX>{TREND_CONTINUATION_ADX_MIN}), fara banda RSI ingusta a momentum-ului.\n"
                  f"   Safety identic: stop-loss/breakeven/trailing/partial la fel ca restul pozitiilor.\n"
                  f"🔧 v29: FUTURES SHORT activ LIVE — {FUTURES_LEVERAGE}x Izolat pe {', '.join(FUTURES_SYMBOLS)}.\n"
@@ -1060,7 +1135,6 @@ def run_bot():
             if not mkt_ok:
                 logger.info(f"🚫 Piata generala slaba: {mkt_reason} — precautie la buy-uri noi.")
 
-            # ========== SPOT LONG ==========
             for symbol in SYMBOLS:
                 try:
                     coin = symbol.replace("USDT", "")
@@ -1143,13 +1217,24 @@ def run_bot():
                             tc_green_ok = last_candle_green or not TREND_CONTINUATION_REQUIRES_GREEN_CANDLE
                             trend_cont_ok = tc_trend_ok and pullback_ok and tc_rsi_ok and tc_green_ok
 
-                        entry_ok = mean_rev_ok or momentum_ok or trend_cont_ok
-                        if momentum_ok and not mean_rev_ok and not trend_cont_ok:
+                        reentry_ok = False
+                        if REENTRY_ENABLED and symbol in reentry_armed:
+                            if time.time() < reentry_armed[symbol]:
+                                reentry_ok = macro_uptrend and ema_ok and adx and adx > REENTRY_ADX_MIN
+                            if not reentry_ok:
+                                del reentry_armed[symbol]
+
+                        entry_ok = mean_rev_ok or momentum_ok or trend_cont_ok or reentry_ok
+                        if reentry_ok:
+                            entry_strategy = "trend-reentry"
+                        elif momentum_ok and not mean_rev_ok and not trend_cont_ok:
                             entry_strategy = "momentum"
                         elif trend_cont_ok and not mean_rev_ok and not momentum_ok:
                             entry_strategy = "trend-continuation"
                         else:
                             entry_strategy = "mean-reversion"
+
+                        in_cooldown = in_cooldown and not reentry_ok
 
                         all_ok = (not bot_paused and not dd_blocked and btc_healthy and fg_ok and mkt_ok
                                   and macro_uptrend and ema_ok and not in_cooldown and volume_ok
@@ -1205,11 +1290,13 @@ def run_bot():
                                         "price": price, "quantity": real_qty, "peak": price,
                                         "opened_at": datetime.now().isoformat(),
                                         "breakeven_activated": False, "partial_sold": False,
+                                        "protected_floor": None,
                                         "stop_pct": stop_pct, "entry_strategy": entry_strategy,
                                         "regime": regime,
                                         "rsi_at_entry": rsi_15m, "adx_at_entry": adx,
                                         "volume_ratio_at_entry": volume_ratio_entry
                                     }
+                                    reentry_armed.pop(symbol, None)
                                     save_state()
                                     strat_emoji = "🚀" if entry_strategy == "momentum" else "🔻"
                                     size_note = f" (poziție {size_multiplier*100:.0f}% - regim {regime})" if size_multiplier < 1.0 else ""
@@ -1228,11 +1315,14 @@ def run_bot():
                         pnl_pct = (price - entry) / entry
                         peak_pnl = (pos["peak"] - entry) / entry
                         drop_from_peak = (pos["peak"] - price) / pos["peak"] if pos["peak"] > 0 else 0
+                        trailing_distance = compute_trailing_distance(adx)
 
-                        if not pos.get("breakeven_activated") and pnl_pct >= BREAKEVEN_TRIGGER:
-                            pos["breakeven_activated"] = True
-                            logger.info(f"🔒 {symbol}: Stop protejat activat la +{pnl_pct*100:.1f}%")
-                            send_telegram(f"🔒 {symbol}: Stop protejat la +{pnl_pct*100:.1f}%")
+                        for trig, floor in PROTECTED_STOP_LEVELS:
+                            if pnl_pct >= trig and (pos.get("protected_floor") is None or floor > pos["protected_floor"]):
+                                pos["protected_floor"] = floor
+                                pos["breakeven_activated"] = True
+                                logger.info(f"🔒 {symbol}: Plasa de siguranta urcata la +{floor*100:.1f}% (PnL curent +{pnl_pct*100:.1f}%)")
+                                send_telegram(f"🔒 {symbol}: Stop protejat la +{floor*100:.1f}% (PnL curent +{pnl_pct*100:.1f}%)")
 
                         if not pos.get("partial_sold") and pnl_pct >= PARTIAL_PROFIT_TRIGGER:
                             half_qty = floor_qty(symbol, pos["quantity"] / 2)
@@ -1251,13 +1341,14 @@ def run_bot():
 
                         should_sell, reason = False, ""
                         stop_pct = pos.get("stop_pct", 0.025)
+                        protected_floor = pos.get("protected_floor")
 
                         if pnl_pct <= -stop_pct:
                             should_sell, reason = True, f"🛑 SL {pnl_pct*100:.1f}% (Stop: {stop_pct*100:.1f}%)"
-                        elif pos.get("breakeven_activated") and pnl_pct <= BREAKEVEN_STOP_LEVEL:
-                            should_sell, reason = True, f"🔒 Stop protejat la +{BREAKEVEN_STOP_LEVEL*100:.1f}% (PnL: {pnl_pct*100:+.1f}%)"
-                        elif peak_pnl >= TRAILING_TRIGGER and drop_from_peak >= TRAILING_DISTANCE:
-                            should_sell, reason = True, f"📉 Trailing (Vârf: +{peak_pnl*100:.1f}%, Acum: +{pnl_pct*100:.1f}%)"
+                        elif protected_floor is not None and pnl_pct <= protected_floor:
+                            should_sell, reason = True, f"🔒 Stop protejat la +{protected_floor*100:.1f}% (PnL: {pnl_pct*100:+.1f}%)"
+                        elif peak_pnl >= TRAILING_TRIGGER and drop_from_peak >= trailing_distance:
+                            should_sell, reason = True, f"📉 Trailing (Vârf: +{peak_pnl*100:.1f}%, Acum: +{pnl_pct*100:.1f}%, dist:{trailing_distance*100:.1f}%)"
                         elif (peak_pnl < TRAILING_TRIGGER and rsi_15m > RSI_SELL
                               and drop_from_peak >= RSI_SELL_MIN_DROP_FROM_PEAK
                               and (not RSI_SELL_REQUIRES_PROFIT
@@ -1299,7 +1390,15 @@ def run_bot():
                                                       rsi_at_entry=pos.get("rsi_at_entry"),
                                                       adx_at_entry=pos.get("adx_at_entry"),
                                                       volume_ratio_at_entry=pos.get("volume_ratio_at_entry"))
-                                    last_sell_time[symbol] = time.time()
+
+                                    trend_still_healthy = (REENTRY_ENABLED and "Trailing" in reason
+                                                            and macro_uptrend and ema_ok
+                                                            and adx and adx > REENTRY_ADX_MIN)
+                                    if trend_still_healthy:
+                                        reentry_armed[symbol] = time.time() + REENTRY_WINDOW_MINUTES * 60
+                                        logger.info(f"🔄 {symbol}: iesire prin trailing, dar trend inca sanatos (ADX={adx}) — re-intrare armata {REENTRY_WINDOW_MINUTES}min, sar cooldown-ul.")
+                                    else:
+                                        last_sell_time[symbol] = time.time()
                                     del positions[symbol]
                                     save_state()
                                 else:
@@ -1320,7 +1419,6 @@ def run_bot():
                 except Exception as e:
                     logger.error(f"❌ Eroare {symbol}: {e}")
 
-            # ========== FUTURES SHORT ==========
             check_and_manage_futures_shorts(total_equity, btc_healthy)
 
             save_state()
