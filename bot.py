@@ -20,7 +20,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from logging.handlers import RotatingFileHandler
 
-__version__ = "29.4"
+__version__ = "29.5"
 
 # ---------------- CONFIG ----------------
 API_KEY = os.environ.get("BITGET_API_KEY", "")
@@ -49,14 +49,12 @@ TRADES_CSV = os.path.join(DATA_DIR, "trades.csv")
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "BGBUSDT", "UNIUSDT", "DOGEUSDT",
            "SOLUSDT", "ADAUSDT", "LINKUSDT"]
 
-# --- Indicatori ---
 RSI_PERIOD = 14
 RSI_BUY_15M = 45
 RSI_MIN_1H = 32
 RSI_MAX_1H = 60
 RSI_SELL = 70
 
-# --- Strategie Momentum ---
 MOMENTUM_ENABLED = True
 RSI_MOMENTUM_MIN = 50
 RSI_MOMENTUM_MAX = 72
@@ -69,7 +67,6 @@ EMA_TOLERANCE = 0.985
 EMA_PERIOD_TREND = 50
 EMA_PERIOD_MACRO = 30
 
-# --- Risk Management ---
 RISK_PER_TRADE = 0.02
 MAX_ALLOCATION_PER_TRADE = 0.35
 MIN_TRADE_USDT = 5
@@ -78,7 +75,6 @@ MAX_TOTAL_EXPOSURE_PCT = 0.75
 MAX_DAILY_DRAWDOWN_PCT = 0.05
 FEE_RATE_PER_SIDE = 0.001
 
-# --- Stop Loss & Trailing ---
 TRAILING_TRIGGER = 0.025
 TRAILING_DISTANCE_BASE = 0.015
 TRAILING_DISTANCE_MAX = 0.035
@@ -91,12 +87,20 @@ def compute_trailing_distance(adx):
     extra = (adx - TRAILING_ADX_REF) / 100.0
     return min(TRAILING_DISTANCE_BASE * (1 + extra), TRAILING_DISTANCE_MAX)
 
-PROTECTED_STOP_LEVELS = [
-    (0.005, 0.003),
-    (0.010, 0.006),
+# v29.5: PROTECTED_STOP_LEVELS (fix, +0.5%→+0.3%, +1.0%→+0.6%) inlocuit cu
+# PROTECTED_STOP_RATIOS — proportional cu stop_pct AL FIECAREI TRANZACTII
+# (care variaza deja 1.2%-4% dupa ATR), nu mai e o valoare fixa identica
+# pentru toate monedele. Fiecare tuplu = (procent_din_stop_ca_prag,
+# procent_din_stop_protejat). Motiv: analiza a 91 tranzactii a aratat castig
+# mediu ~$0.035 vs pierdere medie ~$0.085 (asimetrie 2.4x) — la o tranzactie
+# cu stop 2.7%, plasa fixa de +0.3% insemna raport risc:protectie de ~9:1;
+# la stop 1.2%, raportul era ~4:1. Acum raportul ramane constant:
+#   la 50% din stop atins -> protejeaza 30% din stop
+#   la 100% din stop atins -> protejeaza 60% din stop
+PROTECTED_STOP_RATIOS = [
+    (0.5, 0.3),
+    (1.0, 0.6),
 ]
-BREAKEVEN_TRIGGER = PROTECTED_STOP_LEVELS[0][0]
-BREAKEVEN_STOP_LEVEL = PROTECTED_STOP_LEVELS[0][1]
 PARTIAL_PROFIT_TRIGGER = 0.025
 RSI_SELL_MIN_DROP_FROM_PEAK = 0.003
 RSI_SELL_REQUIRES_PROFIT = True
@@ -106,30 +110,24 @@ REENTRY_ENABLED = True
 REENTRY_WINDOW_MINUTES = 60
 REENTRY_ADX_MIN = 30
 
-# --- Time & Position ---
 COOLDOWN_MINUTES = 45
 MAX_CONCURRENT_POSITIONS = 3
 MAX_HOLD_HOURS = 168
 
-# --- Volatilitate ---
 ATR_PERIOD = 14
 
-# --- Volum & Spread ---
 MIN_VOLUME_RATIO = 1.1
 MAX_SPREAD_PCT = 0.003
 MOMENTUM_REQUIRES_GREEN_CANDLE = True
 
-# --- Correlation ---
 CORRELATION_WINDOW = 50
 MAX_CORRELATION = 0.92
 
-# --- Market Regime ---
 ADX_PERIOD = 14
 ADX_TREND_THRESHOLD = 20
 REQUIRE_TREND_REGIME = False
 ALLOW_MOMENTUM_IN_RANGE = False
 
-# --- Trend Continuation ---
 TREND_CONTINUATION_ENABLED = True
 TREND_CONTINUATION_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 TREND_CONTINUATION_ADX_MIN = 30
@@ -140,7 +138,6 @@ TREND_CONTINUATION_RSI_MIN = 40
 TREND_CONTINUATION_RSI_MAX = 78
 TREND_CONTINUATION_REQUIRES_GREEN_CANDLE = True
 
-# --- Short Continuation (v29.4 NOU) ---
 SHORT_CONTINUATION_ENABLED = True
 SHORT_CONTINUATION_ADX_MIN = 30
 SHORT_CONTINUATION_BOUNCE_LOOKBACK = 8
@@ -150,18 +147,15 @@ SHORT_CONTINUATION_RSI_MIN = 22
 SHORT_CONTINUATION_RSI_MAX = 60
 SHORT_CONTINUATION_REQUIRES_RED_CANDLE = True
 
-# --- Filtru BTC ---
 BTC_SYMBOL = "BTCUSDT"
 BTC_DROP_THRESHOLD = 0.04
 BTC_DROP_LOOKBACK_H = 4
 BTC_EMA_TOLERANCE = 0.99
 
-# --- Fear & Greed Index ---
 FEAR_GREED_ENABLED = False
 FEAR_GREED_EXTREME_THRESHOLD = 15
 FEAR_GREED_CACHE_MINUTES = 30
 
-# --- Filtru piata generala crypto ---
 MARKET_TREND_ENABLED = False
 MARKET_DROP_THRESHOLD = 0.03
 MARKET_TREND_CACHE_MINUTES = 15
@@ -169,9 +163,6 @@ MARKET_TREND_CACHE_MINUTES = 15
 REQUEST_TIMEOUT = 10
 LOOP_INTERVAL = 120
 
-# ═══════════════════════════════════════════════════════════════
-# FUTURES SHORT — v29 NOU, LIVE
-# ═══════════════════════════════════════════════════════════════
 FUTURES_ENABLED = True
 FUTURES_LEVERAGE = 2
 FUTURES_MARGIN_MODE = "isolated"
@@ -192,7 +183,6 @@ if not DRY_RUN and not (API_KEY and SECRET_KEY and PASSPHRASE):
     print("EROARE: lipsesc credențialele Bitget și DRY_RUN=false. Opresc botul.")
     sys.exit(1)
 
-# ---------------- LOGGING ----------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
@@ -931,19 +921,21 @@ def check_and_manage_futures_shorts(total_equity, btc_healthy):
                 trailing_distance_s = compute_trailing_distance(adx_short)
                 should_close, reason = False, ""
 
-                for trig, floor in PROTECTED_STOP_LEVELS:
+                for trig_ratio, floor_ratio in PROTECTED_STOP_RATIOS:
+                    trig = stop_pct * trig_ratio
+                    floor = stop_pct * floor_ratio
                     if pnl_pct >= trig and (pos.get("protected_floor") is None or floor > pos["protected_floor"]):
                         pos["protected_floor"] = floor
                         pos["breakeven_activated"] = True
                         save_state()
-                        send_telegram(f"🔒 {symbol} SHORT: Stop protejat la +{floor*100:.1f}% (PnL curent +{pnl_pct*100:.1f}%)")
+                        send_telegram(f"🔒 {symbol} SHORT: Stop protejat la +{floor*100:.2f}% (PnL curent +{pnl_pct*100:.1f}%, stop={stop_pct*100:.1f}%)")
 
                 protected_floor_s = pos.get("protected_floor")
 
                 if pnl_pct <= -stop_pct:
                     should_close, reason = True, f"🛑 SL short {pnl_pct*100:.1f}%"
                 elif protected_floor_s is not None and pnl_pct <= protected_floor_s:
-                    should_close, reason = True, f"🔒 Stop protejat short la +{protected_floor_s*100:.1f}% (PnL: {pnl_pct*100:+.1f}%)"
+                    should_close, reason = True, f"🔒 Stop protejat short la +{protected_floor_s*100:.2f}% (PnL: {pnl_pct*100:+.1f}%)"
                 elif peak_pnl >= TRAILING_TRIGGER and rise_from_peak >= trailing_distance_s:
                     should_close, reason = True, f"📉 Trailing short (varf +{peak_pnl*100:.1f}%, dist:{trailing_distance_s*100:.1f}%)"
                 elif rsi_15m < 30 and pnl_pct > 0.005:
@@ -1072,28 +1064,26 @@ def run_bot():
     start_msg = (f"🤖 Bot v{__version__} (Spot Long + Futures Short) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"💾 Date salvate în: {DATA_DIR}{' ✅ persistent' if DATA_DIR != '.' else ' ⚠️ EFEMER - se pierde la redeploy!'}\n"
-                 f"🔧 v29.4 NOU:\n"
-                 f"• Plase de siguranta in trepte: +0.5%→+0.3%, +1.0%→+0.6% (nu doar un prag fix).\n"
-                 f"• Trailing dinamic: distanta creste cu ADX ({TRAILING_DISTANCE_BASE*100:.1f}%→{TRAILING_DISTANCE_MAX*100:.1f}% max) — nu mai scoate\n"
-                 f"  pozitii din trenduri lungi la orice recul normal (ex. BTC 64k→80k, ratat aproape complet).\n"
-                 f"• Re-intrare automata (long si short): daca trailing-ul inchide o pozitie dar\n"
-                 f"  trendul ramane confirmat (ADX>{REENTRY_ADX_MIN}), cumpara/vinde din nou fara sa astepte semnal nou.\n"
-                 f"• Short-Continuation NOU: oglinda short a Trend Continuation — prinde caderi\n"
-                 f"  sustinute (ex. BTC 80k→78k), nu doar inceputul lor.\n"
-                 f"🔧 v29.3: Stop protejat de baza acum la +0.5% (era 1.5%).\n"
+                 f"🔧 v29.5 NOU:\n"
+                 f"• Plase de siguranta acum PROPORTIONALE cu stop-loss-ul fiecarei\n"
+                 f"  tranzactii (50% din stop → protejeaza 30% din el; 100% din stop → protejeaza\n"
+                 f"  60% din el), nu mai sunt praguri fixe. Motiv: analiza a 91 tranzactii a aratat\n"
+                 f"  castig mediu ~$0.035 vs pierdere medie ~$0.085 (asimetrie 2.4x) — pragurile fixe\n"
+                 f"  nu se adaptau la marimea reala a riscului per tranzactie.\n"
+                 f"• Fix resturi (BTC/ETH): la inchidere completa, vinde balanta REALA din cont,\n"
+                 f"  nu doar cantitatea urmarita intern — elimina acumularea de zecimale nevandute.\n"
+                 f"🔧 v29.4: Plase in trepte, trailing dinamic (ADX), re-intrare automata (long+short),\n"
+                 f"   Short-Continuation (oglinda short a Trend Continuation).\n"
+                 f"🔧 v29.3: Stop protejat de baza pornea la +0.5% (acum inlocuit de sistemul proportional).\n"
                  f"🔧 v29.2: RSI_MOMENTUM_1H_MAX urcat 68→{RSI_MOMENTUM_1H_MAX} — momentum-ul nu mai e blocat de RSI 1h saturat pe rally-uri.\n"
                  f"🔧 v29: Rate limiter, circuit breaker, health server (port {HEALTH_PORT}) pentru Northflank.\n"
                  f"🔧 v29.1: Trend Continuation — doar BTC/ETH, cumpara pe mic pullback (0.3-2%)\n"
                  f"   in trend puternic (ADX>{TREND_CONTINUATION_ADX_MIN}), fara banda RSI ingusta a momentum-ului.\n"
-                 f"   Safety identic: stop-loss/breakeven/trailing/partial la fel ca restul pozitiilor.\n"
                  f"🔧 v29: FUTURES SHORT activ LIVE — {FUTURES_LEVERAGE}x Izolat pe {', '.join(FUTURES_SYMBOLS)}.\n"
-                 f"   Config RSI {SHORT_RSI_MIN}-{SHORT_RSI_MAX} (singura testata prin backtest: -3.0% full-period,\n"
-                 f"   55.5% win rate, negativ pe 5/6 ferestre OOS — FARA edge statistic dovedit, doar risc administrat).\n"
                  f"   Long ramane pe Spot, Short pe Futures — fara conflict intre ele.\n"
                  f"🔧 v27.1: trades.csv salveaza si RSI/ADX/volum de la INTRARE pentru backtesting.\n"
                  f"🔧 v27: Alocare max/tranzactie {MAX_ALLOCATION_PER_TRADE*100:.0f}%, expunere totala max {MAX_TOTAL_EXPOSURE_PCT*100:.0f}%.\n"
                  f"🔧 v26: Time exit la {MAX_HOLD_HOURS}h (7 zile).\n"
-                 f"🔧 v25: stop protejat iese la +{BREAKEVEN_STOP_LEVEL*100:.1f}% brut (≈ zero net), nu la -0.5%.\n"
                  f"🔧 v24: RSI formula Wilder, candele sortate cronologic, momentum cere candela verde.\n"
                  f"🔧 v23: RSI>70 inchide pozitia DOAR daca e pe profit net (min +{RSI_SELL_MIN_NET_PROFIT*100:.1f}%).\n"
                  f"Comenzi: /pause /resume /status /stats /resetstats\n"
@@ -1315,14 +1305,17 @@ def run_bot():
                         pnl_pct = (price - entry) / entry
                         peak_pnl = (pos["peak"] - entry) / entry
                         drop_from_peak = (pos["peak"] - price) / pos["peak"] if pos["peak"] > 0 else 0
+                        stop_pct = pos.get("stop_pct", 0.025)
                         trailing_distance = compute_trailing_distance(adx)
 
-                        for trig, floor in PROTECTED_STOP_LEVELS:
+                        for trig_ratio, floor_ratio in PROTECTED_STOP_RATIOS:
+                            trig = stop_pct * trig_ratio
+                            floor = stop_pct * floor_ratio
                             if pnl_pct >= trig and (pos.get("protected_floor") is None or floor > pos["protected_floor"]):
                                 pos["protected_floor"] = floor
                                 pos["breakeven_activated"] = True
-                                logger.info(f"🔒 {symbol}: Plasa de siguranta urcata la +{floor*100:.1f}% (PnL curent +{pnl_pct*100:.1f}%)")
-                                send_telegram(f"🔒 {symbol}: Stop protejat la +{floor*100:.1f}% (PnL curent +{pnl_pct*100:.1f}%)")
+                                logger.info(f"🔒 {symbol}: Plasa urcata la +{floor*100:.2f}% (PnL curent +{pnl_pct*100:.1f}%, stop={stop_pct*100:.1f}%)")
+                                send_telegram(f"🔒 {symbol}: Stop protejat la +{floor*100:.2f}% (PnL curent +{pnl_pct*100:.1f}%)")
 
                         if not pos.get("partial_sold") and pnl_pct >= PARTIAL_PROFIT_TRIGGER:
                             half_qty = floor_qty(symbol, pos["quantity"] / 2)
@@ -1340,13 +1333,12 @@ def run_bot():
                                     reconcile_position_balance(symbol, coin, pos)
 
                         should_sell, reason = False, ""
-                        stop_pct = pos.get("stop_pct", 0.025)
                         protected_floor = pos.get("protected_floor")
 
                         if pnl_pct <= -stop_pct:
                             should_sell, reason = True, f"🛑 SL {pnl_pct*100:.1f}% (Stop: {stop_pct*100:.1f}%)"
                         elif protected_floor is not None and pnl_pct <= protected_floor:
-                            should_sell, reason = True, f"🔒 Stop protejat la +{protected_floor*100:.1f}% (PnL: {pnl_pct*100:+.1f}%)"
+                            should_sell, reason = True, f"🔒 Stop protejat la +{protected_floor*100:.2f}% (PnL: {pnl_pct*100:+.1f}%)"
                         elif peak_pnl >= TRAILING_TRIGGER and drop_from_peak >= trailing_distance:
                             should_sell, reason = True, f"📉 Trailing (Vârf: +{peak_pnl*100:.1f}%, Acum: +{pnl_pct*100:.1f}%, dist:{trailing_distance*100:.1f}%)"
                         elif (peak_pnl < TRAILING_TRIGGER and rsi_15m > RSI_SELL
@@ -1366,7 +1358,11 @@ def run_bot():
                                 should_sell, reason = True, f"⏰ Time exit ({hours_held:.1f}h)"
 
                         if should_sell:
-                            sell_qty = floor_qty(symbol, pos["quantity"])
+                            if DRY_RUN:
+                                sell_qty = floor_qty(symbol, pos["quantity"])
+                            else:
+                                real_bal = get_spot_balance(coin)
+                                sell_qty = floor_qty(symbol, real_bal) if real_bal > 0 else floor_qty(symbol, pos["quantity"])
                             if sell_qty > 0:
                                 result = place_order(symbol, "sell", quantity=sell_qty)
                                 if result.get("code") == "00000":
