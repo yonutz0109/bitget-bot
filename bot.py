@@ -20,7 +20,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from logging.handlers import RotatingFileHandler
 
-__version__ = "29.5"
+__version__ = "29.6"
 
 # ---------------- CONFIG ----------------
 API_KEY = os.environ.get("BITGET_API_KEY", "")
@@ -49,12 +49,14 @@ TRADES_CSV = os.path.join(DATA_DIR, "trades.csv")
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "BGBUSDT", "UNIUSDT", "DOGEUSDT",
            "SOLUSDT", "ADAUSDT", "LINKUSDT"]
 
+# --- Indicatori ---
 RSI_PERIOD = 14
 RSI_BUY_15M = 45
 RSI_MIN_1H = 32
 RSI_MAX_1H = 60
 RSI_SELL = 70
 
+# --- Strategie Momentum ---
 MOMENTUM_ENABLED = True
 RSI_MOMENTUM_MIN = 50
 RSI_MOMENTUM_MAX = 72
@@ -67,6 +69,7 @@ EMA_TOLERANCE = 0.985
 EMA_PERIOD_TREND = 50
 EMA_PERIOD_MACRO = 30
 
+# --- Risk Management ---
 RISK_PER_TRADE = 0.02
 MAX_ALLOCATION_PER_TRADE = 0.35
 MIN_TRADE_USDT = 5
@@ -75,6 +78,7 @@ MAX_TOTAL_EXPOSURE_PCT = 0.75
 MAX_DAILY_DRAWDOWN_PCT = 0.05
 FEE_RATE_PER_SIDE = 0.001
 
+# --- Stop Loss & Trailing ---
 TRAILING_TRIGGER = 0.025
 TRAILING_DISTANCE_BASE = 0.015
 TRAILING_DISTANCE_MAX = 0.035
@@ -110,24 +114,30 @@ REENTRY_ENABLED = True
 REENTRY_WINDOW_MINUTES = 60
 REENTRY_ADX_MIN = 30
 
+# --- Time & Position ---
 COOLDOWN_MINUTES = 45
 MAX_CONCURRENT_POSITIONS = 3
 MAX_HOLD_HOURS = 168
 
+# --- Volatilitate ---
 ATR_PERIOD = 14
 
+# --- Volum & Spread ---
 MIN_VOLUME_RATIO = 1.1
 MAX_SPREAD_PCT = 0.003
 MOMENTUM_REQUIRES_GREEN_CANDLE = True
 
+# --- Correlation ---
 CORRELATION_WINDOW = 50
 MAX_CORRELATION = 0.92
 
+# --- Market Regime ---
 ADX_PERIOD = 14
 ADX_TREND_THRESHOLD = 20
 REQUIRE_TREND_REGIME = False
 ALLOW_MOMENTUM_IN_RANGE = False
 
+# --- Trend Continuation ---
 TREND_CONTINUATION_ENABLED = True
 TREND_CONTINUATION_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 TREND_CONTINUATION_ADX_MIN = 30
@@ -138,6 +148,7 @@ TREND_CONTINUATION_RSI_MIN = 40
 TREND_CONTINUATION_RSI_MAX = 78
 TREND_CONTINUATION_REQUIRES_GREEN_CANDLE = True
 
+# --- Short Continuation ---
 SHORT_CONTINUATION_ENABLED = True
 SHORT_CONTINUATION_ADX_MIN = 30
 SHORT_CONTINUATION_BOUNCE_LOOKBACK = 8
@@ -147,22 +158,49 @@ SHORT_CONTINUATION_RSI_MIN = 22
 SHORT_CONTINUATION_RSI_MAX = 60
 SHORT_CONTINUATION_REQUIRES_RED_CANDLE = True
 
+# --- Filtru BTC ---
 BTC_SYMBOL = "BTCUSDT"
 BTC_DROP_THRESHOLD = 0.04
 BTC_DROP_LOOKBACK_H = 4
 BTC_EMA_TOLERANCE = 0.99
 
+# --- Fear & Greed Index ---
 FEAR_GREED_ENABLED = False
 FEAR_GREED_EXTREME_THRESHOLD = 15
 FEAR_GREED_CACHE_MINUTES = 30
 
+# --- Filtru piata generala crypto ---
 MARKET_TREND_ENABLED = False
 MARKET_DROP_THRESHOLD = 0.03
 MARKET_TREND_CACHE_MINUTES = 15
 
 REQUEST_TIMEOUT = 10
-LOOP_INTERVAL = 120
+# v29.6: LOOP_INTERVAL redus de la 120s la 45s. Motiv: BGB a iesit la -2.5%
+# desi stopul era 1.2% — pretul a trecut mult sub nivelul de stop intre doua
+# verificari consecutive (la 2 minute distanta), iar botul a vandut abia la
+# urmatoarea verificare, la un pret mult mai prost. Verificand mai des,
+# fereastra in care pretul poate "aluneca" sub stop se reduce de ~3x.
+# Costul: mai multe apeluri API, dar rate limiter-ul (8 req/s) le gestioneaza.
+LOOP_INTERVAL = 45
 
+# ═══════════════════════════════════════════════════════════════
+# v29.6 NOU: STOP-LOSS REAL LA EXCHANGE
+# ═══════════════════════════════════════════════════════════════
+# Pana acum, stop-loss-ul exista DOAR in mintea botului: el verifica periodic
+# pretul si, daca trecuse sub prag, trimitea un ordin de vanzare la piata.
+# Problema: intre doua verificari pretul poate cadea mult sub prag (exact ce
+# s-a intamplat cu BGB: stop 1.2%, iesire reala -2.5%).
+# Acum, imediat dupa ce cumparam, plasam SI un ordin stop-loss REAL pe Bitget.
+# Acesta sta la exchange si se declanseaza automat, instant, chiar daca botul
+# e oprit, repornit sau intarziat — nu mai depinde de ciclul de verificare.
+# Botul isi pastreaza si logica interna (plase de siguranta, trailing, RSI),
+# care poate inchide pozitia mai devreme daca e cazul; in acel caz anulam
+# intai ordinul de la exchange, ca sa nu ramana un ordin orfan.
+EXCHANGE_STOP_LOSS_ENABLED = True
+
+# ═══════════════════════════════════════════════════════════════
+# FUTURES SHORT
+# ═══════════════════════════════════════════════════════════════
 FUTURES_ENABLED = True
 FUTURES_LEVERAGE = 2
 FUTURES_MARGIN_MODE = "isolated"
@@ -183,6 +221,7 @@ if not DRY_RUN and not (API_KEY and SECRET_KEY and PASSPHRASE):
     print("EROARE: lipsesc credențialele Bitget și DRY_RUN=false. Opresc botul.")
     sys.exit(1)
 
+# ---------------- LOGGING ----------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
@@ -697,6 +736,55 @@ def place_order(symbol, side, amount_usdt=None, quantity=None):
     log_json("ORDER", {"symbol": symbol, "side": side, "client_oid": client_oid, "result": result})
     return result if result is not None else {"code": "error", "msg": "no response"}
 
+def place_exchange_stop_loss(symbol, quantity, stop_price):
+    """v29.6: plaseaza un ordin stop-loss REAL pe Bitget (plan order de tip
+    'loss_plan'). Se declanseaza automat la exchange cand pretul atinge
+    stop_price, indiferent daca botul ruleaza sau nu.
+    Returneaza orderId-ul daca a reusit, altfel None."""
+    if not EXCHANGE_STOP_LOSS_ENABLED or DRY_RUN:
+        if DRY_RUN:
+            logger.info(f"[DRY_RUN] Stop-loss exchange {symbol} qty={quantity} @ {stop_price}")
+        return None
+    path = "/api/v2/spot/plan/place-plan-order"
+    qty = floor_qty(symbol, quantity)
+    body = {
+        "symbol": symbol,
+        "side": "sell",
+        "triggerPrice": str(round(stop_price, 8)),
+        "triggerType": "mark_price",
+        "orderType": "market",
+        "size": str(qty),
+        "planType": "amount",
+        "clientOid": str(uuid.uuid4())
+    }
+    body_str = json.dumps(body)
+    headers = get_headers("POST", path, body_str)
+    result = safe_request("POST", BASE_URL + path, headers=headers, data=body_str)
+    if result and result.get("code") == "00000":
+        oid = result.get("data", {}).get("orderId")
+        logger.info(f"🛡️ {symbol}: stop-loss REAL plasat la exchange @ ${stop_price:.6f} (id={oid})")
+        return oid
+    logger.warning(f"⚠️ {symbol}: nu am putut plasa stop-loss la exchange: {result}")
+    return None
+
+
+def cancel_exchange_stop_loss(symbol, order_id):
+    """v29.6: anuleaza ordinul stop-loss de la exchange (cand inchidem pozitia
+    prin alta regula: trailing, plasa de siguranta, RSI, time exit). Fara asta,
+    ar ramane un ordin orfan care ar putea vinde monede pe care nu le mai avem."""
+    if not order_id or DRY_RUN:
+        return
+    path = "/api/v2/spot/plan/cancel-plan-order"
+    body = {"orderId": str(order_id), "symbol": symbol}
+    body_str = json.dumps(body)
+    headers = get_headers("POST", path, body_str)
+    result = safe_request("POST", BASE_URL + path, headers=headers, data=body_str)
+    if result and result.get("code") == "00000":
+        logger.info(f"🧹 {symbol}: stop-loss de la exchange anulat (id={order_id})")
+    else:
+        logger.warning(f"⚠️ {symbol}: nu am putut anula stop-loss-ul de la exchange: {result}")
+
+
 def get_total_equity(usdt_bal):
     total = usdt_bal
     for sym, pos in positions.items():
@@ -921,6 +1009,7 @@ def check_and_manage_futures_shorts(total_equity, btc_healthy):
                 trailing_distance_s = compute_trailing_distance(adx_short)
                 should_close, reason = False, ""
 
+                # v29.5: plase proportionale cu stop_pct al acestei pozitii
                 for trig_ratio, floor_ratio in PROTECTED_STOP_RATIOS:
                     trig = stop_pct * trig_ratio
                     floor = stop_pct * floor_ratio
@@ -1064,14 +1153,15 @@ def run_bot():
     start_msg = (f"🤖 Bot v{__version__} (Spot Long + Futures Short) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"💾 Date salvate în: {DATA_DIR}{' ✅ persistent' if DATA_DIR != '.' else ' ⚠️ EFEMER - se pierde la redeploy!'}\n"
-                 f"🔧 v29.5 NOU:\n"
-                 f"• Plase de siguranta acum PROPORTIONALE cu stop-loss-ul fiecarei\n"
-                 f"  tranzactii (50% din stop → protejeaza 30% din el; 100% din stop → protejeaza\n"
-                 f"  60% din el), nu mai sunt praguri fixe. Motiv: analiza a 91 tranzactii a aratat\n"
-                 f"  castig mediu ~$0.035 vs pierdere medie ~$0.085 (asimetrie 2.4x) — pragurile fixe\n"
-                 f"  nu se adaptau la marimea reala a riscului per tranzactie.\n"
-                 f"• Fix resturi (BTC/ETH): la inchidere completa, vinde balanta REALA din cont,\n"
-                 f"  nu doar cantitatea urmarita intern — elimina acumularea de zecimale nevandute.\n"
+                 f"🔧 v29.6 NOU:\n"
+                 f"• STOP-LOSS REAL la exchange: imediat dupa fiecare cumparare, botul plaseaza\n"
+                 f"  un ordin stop-loss direct pe Bitget. Se declanseaza AUTOMAT si INSTANT,\n"
+                 f"  chiar daca botul e oprit sau intarziat. Motiv: BGB a iesit la -2.5% desi\n"
+                 f"  stopul era 1.2% — pretul trecuse sub prag intre doua verificari.\n"
+                 f"• Ciclul de verificare redus 120s → {LOOP_INTERVAL}s, ca sa reactioneze mai rapid.\n"
+                 f"🔧 v29.5: Plase de siguranta PROPORTIONALE cu stop-loss-ul fiecarei tranzactii\n"
+                 f"   (50% din stop → protejeaza 30%; 100% din stop → protejeaza 60%).\n"
+                 f"   + fix resturi BTC/ETH (vinde balanta reala, nu doar cantitatea urmarita intern).\n"
                  f"🔧 v29.4: Plase in trepte, trailing dinamic (ADX), re-intrare automata (long+short),\n"
                  f"   Short-Continuation (oglinda short a Trend Continuation).\n"
                  f"🔧 v29.3: Stop protejat de baza pornea la +0.5% (acum inlocuit de sistemul proportional).\n"
@@ -1172,7 +1262,6 @@ def run_bot():
 
                     if symbol not in positions:
                         if len(positions) >= MAX_CONCURRENT_POSITIONS: continue
-
                         in_cooldown = symbol in last_sell_time and (time.time() - last_sell_time[symbol]) / 60 < COOLDOWN_MINUTES
                         corr_ok = check_correlation_filter(symbol)
                         regime_ok = (regime == "TREND") if REQUIRE_TREND_REGIME else True
@@ -1286,6 +1375,11 @@ def run_bot():
                                         "rsi_at_entry": rsi_15m, "adx_at_entry": adx,
                                         "volume_ratio_at_entry": volume_ratio_entry
                                     }
+                                    # v29.6: plasam imediat stop-loss REAL la exchange, ca sa
+                                    # fim protejati chiar daca botul e oprit sau intarziat.
+                                    sl_price = price * (1 - stop_pct)
+                                    sl_id = place_exchange_stop_loss(symbol, real_qty, sl_price)
+                                    positions[symbol]["exchange_sl_id"] = sl_id
                                     reentry_armed.pop(symbol, None)
                                     save_state()
                                     strat_emoji = "🚀" if entry_strategy == "momentum" else "🔻"
@@ -1301,6 +1395,36 @@ def run_bot():
                     else:
                         pos = positions[symbol]
                         entry = pos["price"]
+
+                        # v29.6: verificam daca stop-loss-ul de la exchange s-a declansat singur
+                        # (pozitia a fost vanduta automat de Bitget, fara ca botul sa stie).
+                        # Fara asta, botul ar crede in continuare ca are pozitia si ar incerca
+                        # sa o gestioneze/vanda la infinit.
+                        if not DRY_RUN and pos.get("exchange_sl_id"):
+                            real_coin_bal = get_spot_balance(coin)
+                            if real_coin_bal * price < MIN_TRADE_USDT * 0.5:
+                                exit_price_est = entry * (1 - pos.get("stop_pct", 0.025))
+                                pnl_est = -pos.get("stop_pct", 0.025)
+                                net_usd_est = (exit_price_est - entry) * pos["quantity"] - (entry * pos["quantity"] + exit_price_est * pos["quantity"]) * FEE_RATE_PER_SIDE
+                                daily_realized_pnl += net_usd_est
+                                opened_dt = datetime.fromisoformat(pos["opened_at"])
+                                hours_held = (datetime.now() - opened_dt).total_seconds() / 3600
+                                msg = (f"🛡️ {symbol}: STOP-LOSS EXCHANGE declansat automat\n"
+                                       f"Pozitia a fost inchisa de Bitget la ~${exit_price_est:.6f} "
+                                       f"({pnl_est*100:.1f}%, est. ${net_usd_est:+.2f})\n"
+                                       f"📅 PnL azi: {daily_realized_pnl:+.2f} USDT")
+                                logger.info(msg); send_telegram(msg)
+                                log_trade_closed(symbol, entry, exit_price_est, pos["quantity"], hours_held,
+                                                 "🛡️ SL exchange (automat)", pos.get("regime", "?"),
+                                                 entry_strategy=pos.get("entry_strategy", "?"),
+                                                 rsi_at_entry=pos.get("rsi_at_entry"),
+                                                 adx_at_entry=pos.get("adx_at_entry"),
+                                                 volume_ratio_at_entry=pos.get("volume_ratio_at_entry"))
+                                last_sell_time[symbol] = time.time()
+                                del positions[symbol]
+                                save_state()
+                                continue
+
                         pos["peak"] = max(pos["peak"], price)
                         pnl_pct = (price - entry) / entry
                         peak_pnl = (pos["peak"] - entry) / entry
@@ -1308,6 +1432,14 @@ def run_bot():
                         stop_pct = pos.get("stop_pct", 0.025)
                         trailing_distance = compute_trailing_distance(adx)
 
+                        # v29.5: plase proportionale cu stop_pct al ACESTEI pozitii —
+                        # inainte erau praguri fixe (+0.5%→+0.3%, +1.0%→+0.6%), identice
+                        # pentru toate tranzactiile indiferent cat de mare era stop-loss-ul
+                        # lor. Analiza a 91 tranzactii a aratat asimetrie 2.4x intre castig
+                        # mediu si pierdere medie, exact din cauza asta: la un stop de 2.7%,
+                        # riscai 2.7% ca sa protejezi doar 0.3% (raport ~9:1); la un stop de
+                        # 1.2%, raportul era ~4:1. Acum raportul risc:protectie ramane
+                        # constant, indiferent de volatilitatea monedei in acel moment.
                         for trig_ratio, floor_ratio in PROTECTED_STOP_RATIOS:
                             trig = stop_pct * trig_ratio
                             floor = stop_pct * floor_ratio
@@ -1320,12 +1452,19 @@ def run_bot():
                         if not pos.get("partial_sold") and pnl_pct >= PARTIAL_PROFIT_TRIGGER:
                             half_qty = floor_qty(symbol, pos["quantity"] / 2)
                             if half_qty > 0:
+                                # v29.6: anulam stop-loss-ul vechi inainte de vanzarea partiala —
+                                # el acopera cantitatea INTREAGA, care dupa vanzare nu mai exista.
+                                cancel_exchange_stop_loss(symbol, pos.get("exchange_sl_id"))
+                                pos["exchange_sl_id"] = None
                                 r = place_order(symbol, "sell", quantity=half_qty)
                                 if r.get("code") == "00000":
                                     pos["quantity"] -= half_qty
                                     pos["partial_sold"] = True
                                     pos["breakeven_activated"] = True
                                     if DRY_RUN: virtual_balance += half_qty * price * 0.999
+                                    # v29.6: replasam stop-loss pentru cantitatea ramasa
+                                    new_sl_price = entry * (1 - pos.get("stop_pct", 0.025))
+                                    pos["exchange_sl_id"] = place_exchange_stop_loss(symbol, pos["quantity"], new_sl_price)
                                     send_telegram(f"💸 {symbol}: Vândut 50% la +{pnl_pct*100:.1f}%")
                                     save_state()
                                 elif not DRY_RUN:
@@ -1358,6 +1497,18 @@ def run_bot():
                                 should_sell, reason = True, f"⏰ Time exit ({hours_held:.1f}h)"
 
                         if should_sell:
+                            # v29.6: anulam intai stop-loss-ul de la exchange, ca sa nu ramana
+                            # un ordin orfan dupa ce vindem noi (prin trailing, plasa de
+                            # siguranta, RSI sau time exit) — altfel ar putea incerca mai
+                            # tarziu sa vanda monede pe care nu le mai avem.
+                            cancel_exchange_stop_loss(symbol, pos.get("exchange_sl_id"))
+                            # v29.5 FIX RESTURI: la inchidere completa, vindem balanta REALA
+                            # din cont, nu doar cantitatea urmarita intern (pos["quantity"]).
+                            # Inainte, rotunjirea in jos (floor_qty) la fiecare tranzactie lasa
+                            # mici resturi nevandute care nu erau niciodata "vazute" data
+                            # viitoare — s-au acumulat in timp la ~$7 in BTC si ~$1.22 in ETH.
+                            # Acum interogam balanta reala chiar inainte de vanzare si vindem
+                            # tot ce gasim acolo (in limita preciziei permise de exchange).
                             if DRY_RUN:
                                 sell_qty = floor_qty(symbol, pos["quantity"])
                             else:
