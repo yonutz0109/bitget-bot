@@ -20,7 +20,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from logging.handlers import RotatingFileHandler
 
-__version__ = "29.6"
+__version__ = "29.7"
 
 # ---------------- CONFIG ----------------
 API_KEY = os.environ.get("BITGET_API_KEY", "")
@@ -91,24 +91,36 @@ def compute_trailing_distance(adx):
     extra = (adx - TRAILING_ADX_REF) / 100.0
     return min(TRAILING_DISTANCE_BASE * (1 + extra), TRAILING_DISTANCE_MAX)
 
-# v29.5: PROTECTED_STOP_LEVELS (fix, +0.5%→+0.3%, +1.0%→+0.6%) inlocuit cu
-# PROTECTED_STOP_RATIOS — proportional cu stop_pct AL FIECAREI TRANZACTII
-# (care variaza deja 1.2%-4% dupa ATR), nu mai e o valoare fixa identica
-# pentru toate monedele. Fiecare tuplu = (procent_din_stop_ca_prag,
-# procent_din_stop_protejat). Motiv: analiza a 91 tranzactii a aratat castig
-# mediu ~$0.035 vs pierdere medie ~$0.085 (asimetrie 2.4x) — la o tranzactie
-# cu stop 2.7%, plasa fixa de +0.3% insemna raport risc:protectie de ~9:1;
-# la stop 1.2%, raportul era ~4:1. Acum raportul ramane constant:
-#   la 50% din stop atins -> protejeaza 30% din stop
-#   la 100% din stop atins -> protejeaza 60% din stop
+# v29.7 FIX CRITIC: PROTECTED_STOP_RATIOS din v29.5 era REGLAT GRESIT si taia
+# castigurile la $0.01 bucata. Analiza tranzactiilor 24-28 sept:
+#   iesiri prin RSI          : 3 tranzactii, media +$0.070
+#   iesiri prin stop protejat: 4 tranzactii, media +$0.010   <-- problema
+#   iesiri prin stop-loss    : 4 tranzactii, media -$0.130
+# Cauza: (0.5, 0.3) inseamna ca plasa se armeaza la 50% din stop si se aseaza
+# la 30% din stop — distanta intre ele e doar 0.2 x stop. La un stop de 1.2%,
+# pretul atinge +0.6%, plasa se pune la +0.36%, si e de ajuns o retragere de
+# 0.24% (zgomot de cateva minute pe BTC) ca sa iesim la +0.3% brut = +0.1% net.
+# Practic ORICE tranzactie care atingea +0.6% era executata fortat la $0.01,
+# in timp ce pierderile mergeau pana la stopul intreg (-1.4% .. -2.6% net).
+# Plafon pe castiguri, pierderi libere — exact invers decat trebuia.
+#
+# v29.7: plasa se armeaza abia cand profitul ajunge la MARIMEA STOPULUI INTREG,
+# iar podeaua sta la cel putin ~0.6 x stop sub pragul de armare, nu la 0.2 x stop.
 PROTECTED_STOP_RATIOS = [
-    (0.5, 0.3),
-    (1.0, 0.6),
+    (1.0, 0.40),
+    (1.8, 1.00),
+    (2.6, 1.80),
 ]
+# v29.7: podeaua nu coboara niciodata sub acest prag brut, indiferent cat de mic
+# e stop_pct. 0.6% brut - 0.2% taxe dus-intors = +0.4% net, adica de 4x mai mult
+# decat +0.1% net cat producea versiunea veche.
+PROTECTED_STOP_MIN_FLOOR = 0.006
 PARTIAL_PROFIT_TRIGGER = 0.025
 RSI_SELL_MIN_DROP_FROM_PEAK = 0.003
 RSI_SELL_REQUIRES_PROFIT = True
-RSI_SELL_MIN_NET_PROFIT = 0.002
+# v29.7: urcat 0.002 -> 0.004. La 0.2% (taxele dus-intors) practic vindeam la
+# zero. Nicio iesire in afara de stopul dur nu mai are voie sub +0.4% net.
+RSI_SELL_MIN_NET_PROFIT = 0.004
 
 REENTRY_ENABLED = True
 REENTRY_WINDOW_MINUTES = 60
@@ -1012,7 +1024,8 @@ def check_and_manage_futures_shorts(total_equity, btc_healthy):
                 # v29.5: plase proportionale cu stop_pct al acestei pozitii
                 for trig_ratio, floor_ratio in PROTECTED_STOP_RATIOS:
                     trig = stop_pct * trig_ratio
-                    floor = stop_pct * floor_ratio
+                    # v29.7: aceeasi podea minima ca la long
+                    floor = min(max(stop_pct * floor_ratio, PROTECTED_STOP_MIN_FLOOR), trig * 0.75)
                     if pnl_pct >= trig and (pos.get("protected_floor") is None or floor > pos["protected_floor"]):
                         pos["protected_floor"] = floor
                         pos["breakeven_activated"] = True
@@ -1027,7 +1040,7 @@ def check_and_manage_futures_shorts(total_equity, btc_healthy):
                     should_close, reason = True, f"🔒 Stop protejat short la +{protected_floor_s*100:.2f}% (PnL: {pnl_pct*100:+.1f}%)"
                 elif peak_pnl >= TRAILING_TRIGGER and rise_from_peak >= trailing_distance_s:
                     should_close, reason = True, f"📉 Trailing short (varf +{peak_pnl*100:.1f}%, dist:{trailing_distance_s*100:.1f}%)"
-                elif rsi_15m < 30 and pnl_pct > 0.005:
+                elif rsi_15m < 30 and pnl_pct > 0.006:  # v29.7: 0.005 -> 0.006 (+0.4% net)
                     should_close, reason = True, f"📊 RSI supravandut {rsi_15m}"
 
                 opened_dt = datetime.fromisoformat(pos["opened_at"])
@@ -1153,7 +1166,13 @@ def run_bot():
     start_msg = (f"🤖 Bot v{__version__} (Spot Long + Futures Short) pornit! Mod: {mode}\n"
                  f"Balance start: {balance_display}\n"
                  f"💾 Date salvate în: {DATA_DIR}{' ✅ persistent' if DATA_DIR != '.' else ' ⚠️ EFEMER - se pierde la redeploy!'}\n"
-                 f"🔧 v29.6 NOU:\n"
+                 f"🔧 v29.7 NOU — FIX CRITIC pe stopul protejat:\n"
+                 f"• Plasa se armeaza acum la 100% din stop (nu 50%) si sta la 40% din stop,\n"
+                 f"  minim +{PROTECTED_STOP_MIN_FLOOR*100:.1f}% brut. Inainte distanta prag→podea era 0.2×stop\n"
+                 f"  (0.24% la un stop de 1.2%) = zgomot, si orice castig era taiat la +$0.01.\n"
+                 f"• Trepte noi: 1.0×stop→40%, 1.8×stop→100%, 2.6×stop→180%.\n"
+                 f"• Nicio iesire in afara stopului dur sub +0.4% net (era +0.2%).\n"
+                 f"🔧 v29.6:\n"
                  f"• STOP-LOSS REAL la exchange: imediat dupa fiecare cumparare, botul plaseaza\n"
                  f"  un ordin stop-loss direct pe Bitget. Se declanseaza AUTOMAT si INSTANT,\n"
                  f"  chiar daca botul e oprit sau intarziat. Motiv: BGB a iesit la -2.5% desi\n"
@@ -1442,7 +1461,9 @@ def run_bot():
                         # constant, indiferent de volatilitatea monedei in acel moment.
                         for trig_ratio, floor_ratio in PROTECTED_STOP_RATIOS:
                             trig = stop_pct * trig_ratio
-                            floor = stop_pct * floor_ratio
+                            # v29.7: podeaua nu coboara sub PROTECTED_STOP_MIN_FLOOR, dar nici
+                            # nu urca peste prag (altfel ne-ar scoate instant la armare).
+                            floor = min(max(stop_pct * floor_ratio, PROTECTED_STOP_MIN_FLOOR), trig * 0.75)
                             if pnl_pct >= trig and (pos.get("protected_floor") is None or floor > pos["protected_floor"]):
                                 pos["protected_floor"] = floor
                                 pos["breakeven_activated"] = True
